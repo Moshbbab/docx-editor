@@ -345,20 +345,39 @@ _SILENCE_PROBE_AFTER = 10.0
 
 @dataclass
 class ExecResult:
-    """Outcome of one exec_code() call against the session kernel."""
+    """Outcome of one exec_code() call against the session kernel.
+
+    ``started`` records whether the kernel began executing this request at all,
+    which disambiguates two statuses:
+
+    - ``"timeout"``: with ``started=True`` your code ran and was still running
+      when the clock ran out (raise ``timeout``, or make the code faster); with
+      ``started=False`` the request never left the queue, because the kernel was
+      still busy with an earlier command — nothing of yours executed, so wait or
+      check what is hogging the session.
+    - ``"ok"`` with ``started=False``: the kernel **discarded** the request
+      without running it. ipykernel aborts everything still queued behind a
+      command that raises, so a request sent while an earlier one was failing
+      comes back clean and empty having done nothing. Re-send it.
+
+    An ``"error"`` result, and any ``"ok"`` with ``started=True``, did execute.
+    """
 
     status: ExecStatus
     stdout: str = ""
     stderr: str = ""
     result: str | None = None  # repr of the last expression, if any
     traceback: str | None = None  # ANSI-stripped traceback when status == "error"
+    started: bool = False  # True once the kernel began executing this request
 
 
 def exec_code(code: str, connection_file: Path = DEFAULT_CONNECTION_FILE, timeout: float = 120.0) -> ExecResult:
     """Execute code in the session kernel and collect its output.
 
     If the kernel is busy, the request queues behind the running one; `timeout`
-    covers the whole wait.
+    covers the whole wait. A timeout therefore has two flavours, told apart by
+    the result's ``started`` flag: your own code ran too long (True), or it never
+    got out of the queue (False).
 
     Args:
         code: Python source to execute in the session
@@ -367,7 +386,10 @@ def exec_code(code: str, connection_file: Path = DEFAULT_CONNECTION_FILE, timeou
 
     Returns:
         ExecResult with status "ok", "error", "timeout", or "dead" (the kernel
-        died mid-execution — its state is lost).
+        died mid-execution — its state is lost), and ``started`` telling whether
+        the kernel began executing this request at all. Check ``started`` on an
+        "ok" result too: ``ok`` with ``started=False`` means the kernel aborted
+        the request behind a failing predecessor and ran nothing.
 
     Raises:
         FileNotFoundError: If no session connection file exists.
@@ -398,6 +420,7 @@ def exec_code(code: str, connection_file: Path = DEFAULT_CONNECTION_FILE, timeou
         result: str | None = None
         traceback: str | None = None
         status: ExecStatus = "ok"
+        started = False
         deadline = time.monotonic() + timeout
         last_activity = time.monotonic()
 
@@ -405,7 +428,12 @@ def exec_code(code: str, connection_file: Path = DEFAULT_CONNECTION_FILE, timeou
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 final: ExecStatus = "dead" if _kernel_dead(kc, connection_file) else "timeout"
-                return ExecResult(status=final, stdout="".join(stdout_parts), stderr="".join(stderr_parts))
+                return ExecResult(
+                    status=final,
+                    stdout="".join(stdout_parts),
+                    stderr="".join(stderr_parts),
+                    started=started,
+                )
             try:
                 msg = kc.get_iopub_msg(timeout=min(remaining, 1.0))
             except Empty:
@@ -414,7 +442,12 @@ def exec_code(code: str, connection_file: Path = DEFAULT_CONNECTION_FILE, timeou
                 if time.monotonic() - last_activity < _SILENCE_PROBE_AFTER:
                     continue
                 if _kernel_dead(kc, connection_file):
-                    return ExecResult(status="dead", stdout="".join(stdout_parts), stderr="".join(stderr_parts))
+                    return ExecResult(
+                        status="dead",
+                        stdout="".join(stdout_parts),
+                        stderr="".join(stderr_parts),
+                        started=started,
+                    )
                 last_activity = time.monotonic()
                 continue
             # Any iopub traffic proves the kernel is alive, whoever it belongs to.
@@ -424,7 +457,12 @@ def exec_code(code: str, connection_file: Path = DEFAULT_CONNECTION_FILE, timeou
 
             msg_type = msg["msg_type"]
             content = msg["content"]
-            if msg_type == "stream":
+            if msg_type == "execute_input":
+                # The kernel broadcasts this the moment it starts executing OUR
+                # request — the only reliable "left the queue" signal, since a
+                # queued request is otherwise indistinguishable from a slow one.
+                started = True
+            elif msg_type == "stream":
                 target = stdout_parts if content["name"] == "stdout" else stderr_parts
                 target.append(content["text"])
             elif msg_type in ("execute_result", "display_data"):
@@ -441,6 +479,7 @@ def exec_code(code: str, connection_file: Path = DEFAULT_CONNECTION_FILE, timeou
             stderr="".join(stderr_parts),
             result=result,
             traceback=traceback,
+            started=started,
         )
     finally:
         kc.stop_channels()
@@ -529,6 +568,7 @@ class EvalResult:
     stderr: str = ""
     traceback: str | None = None
     error: dict[str, Any] | None = None  # {"type", "message", <structured fields>} when the expression raised
+    started: bool = False  # as in ExecResult: False on a timeout means the request never left the queue
 
 
 def eval_code(expr: str, connection_file: Path = DEFAULT_CONNECTION_FILE, timeout: float = 120.0) -> EvalResult:
@@ -564,8 +604,21 @@ def eval_code(expr: str, connection_file: Path = DEFAULT_CONNECTION_FILE, timeou
     """
     res = exec_code(_EVAL_TEMPLATE % (repr(expr),), connection_file=connection_file, timeout=timeout)
     if res.status != "ok":
-        return EvalResult(status=res.status, stdout=res.stdout, stderr=res.stderr, traceback=res.traceback)
+        return EvalResult(
+            status=res.status,
+            stdout=res.stdout,
+            stderr=res.stderr,
+            traceback=res.traceback,
+            started=res.started,
+        )
     if res.result is None:
+        if not res.started:
+            # Not a transport fault: the kernel discarded the request without
+            # running it (see ExecResult.started), so there is no reply to decode.
+            raise SessionError(
+                "The kernel discarded this request without running it — it was queued behind a command "
+                "that raised. Nothing was evaluated; re-send it."
+            )
         raise SessionError("eval transport failed: kernel returned no result for the eval wrapper")
     try:
         payload = json.loads(ast.literal_eval(res.result))
@@ -578,6 +631,7 @@ def eval_code(expr: str, connection_file: Path = DEFAULT_CONNECTION_FILE, timeou
             stderr=res.stderr,
             traceback=_strip_internal_paths(payload["traceback"]),
             error=payload["error"],
+            started=res.started,
         )
     return EvalResult(
         status="ok",
@@ -585,6 +639,7 @@ def eval_code(expr: str, connection_file: Path = DEFAULT_CONNECTION_FILE, timeou
         serialized=payload["serialized"],
         stdout=res.stdout,
         stderr=res.stderr,
+        started=res.started,
     )
 
 
@@ -738,11 +793,25 @@ def _run(args: argparse.Namespace) -> int:
         print(_KERNEL_DIED_MSG, file=sys.stderr)
         return EXIT_KERNEL_DEAD
     if res.status == "timeout":
+        if res.started:
+            message = f"Timed out after {args.timeout}s (kernel still running; the command may still finish)."
+        else:
+            message = (
+                f"Timed out after {args.timeout}s while still queued — your code never started. The kernel is "
+                "busy with an earlier command; wait for it, raise --timeout, or check 'docx-session status'."
+            )
+        print(message, file=sys.stderr)
+        return EXIT_TIMEOUT
+    if not res.started:
+        # "ok" but never dequeued: the kernel discards everything queued behind
+        # a command that raises, so this returned clean without running. Exit
+        # code stays EXIT_OK (changing it is a contract change), which is
+        # exactly why the warning has to be loud.
         print(
-            f"Timed out after {args.timeout}s (kernel still running; the command may still finish).",
+            "Warning: the kernel discarded this request without running it — it was queued behind a "
+            "command that raised. Nothing was executed; re-send it.",
             file=sys.stderr,
         )
-        return EXIT_TIMEOUT
     return EXIT_OK
 
 

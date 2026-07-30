@@ -23,7 +23,7 @@ with Document.open("contract.docx", author="Legal Team") as doc:
     doc.save()
 ```
 
-If the source `.docx` was modified outside this library since the workspace was created, `Document.open()` raises `WorkspaceSyncError` instead of silently discarding the workspace. The same error is raised when a leftover workspace holds unsaved changes from a previous session — for example, one that saved to a different path (or whose save failed) and never called `close()` — since adopting it would carry those edits into the new session. The error message includes the workspace path. Pass `force_recreate=True` to acknowledge the divergence and re-unpack from the current source:
+If the source `.docx` was modified outside this library since the workspace was created, `Document.open()` raises `WorkspaceSyncError` instead of silently discarding the workspace. The same error is raised when a leftover workspace holds unsaved changes from a previous session — for example, one that saved to a different path (or whose save failed) and never called `close()` — since adopting it would carry those edits into the new session. The error message includes the workspace path. Pass `force_recreate=True` to acknowledge the divergence and re-unpack from the current source (after a crashed script, one `Document.discard_workspace("contract.docx")` beats carrying the flag on every open — it also clears a lock the dead process left behind):
 
 ```python
 doc = Document.open("contract.docx", force_recreate=True)
@@ -73,6 +73,18 @@ with Document.open("contract.docx") as doc:
 Use the `P{index}#{hash}` part as the `paragraph=` argument. Edit methods return a new paragraph ref after the hash changes, so keep the returned value when chaining edits in the same paragraph.
 
 When the search text appears more than once in the target paragraph, pass `occurrence=` (0-based, so `occurrence=1` is the second match) to `replace()`, `delete()`, `insert_after()`, `insert_before()`, and `add_comment()`. Omitting it requires a unique match — otherwise the call raises `AmbiguousTextError`.
+
+Better still, let a search do that bookkeeping: those five methods (and the `EditOperation` constructors) accept a `SearchResult` in place of the target text, taking the paragraph and occurrence from the match.
+
+```python
+with Document.open("contract.docx") as doc:
+    if match := doc.find_text("30 days"):     # or find_all(...)[1] for the 2nd
+        doc.replace(match, "60 days")         # no paragraph=, no occurrence=
+```
+
+Check the result first: `find_text()` returns `None` when there is no match, and
+passing that `None` as a target raises `ValueError` (`CommentError` from
+`add_comment`) rather than quietly doing nothing.
 
 ## Track Changes
 

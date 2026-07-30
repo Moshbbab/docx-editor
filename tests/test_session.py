@@ -105,7 +105,133 @@ def test_exec_timeout(tmp_path):
     try:
         res = exec_code("import time; time.sleep(30)", connection_file=conn, timeout=2.0)
         assert res.status == "timeout"
+        assert res.started is True  # our own code ran and overran
     finally:
+        stop_session(conn)
+
+
+def test_exec_ok_reports_started(session_conn):
+    assert exec_code("1 + 1", connection_file=session_conn).started is True
+
+
+def test_exec_error_reports_started(session_conn):
+    """An exception still means the code executed."""
+    assert exec_code("1 / 0", connection_file=session_conn).started is True
+
+
+def test_exec_timeout_while_queued_reports_not_started(tmp_path):
+    """A timeout waiting in the QUEUE is distinguishable from a timeout of your
+    own running code (ISSUES.md #52): nothing of ours executed.
+
+    Own kernel, occupied by a fire-and-forget sleep sent on a separate client,
+    so our request cannot leave the queue before the clock runs out.
+    """
+    from docx_editor.session import _client
+
+    conn = tmp_path / "kernel.json"
+    start_session(conn)
+    hog = _client(conn)
+    try:
+        hog.execute("import time; time.sleep(30)")  # never waited on
+        time.sleep(1.0)  # let the kernel pick it up and go busy
+
+        res = exec_code("1 + 1", connection_file=conn, timeout=2.0)
+        assert res.status == "timeout"
+        assert res.started is False  # never left the queue
+        assert res.result is None
+    finally:
+        hog.stop_channels()
+        stop_session(conn)
+
+
+def test_cli_distinguishes_the_two_timeouts(tmp_path, capsys):
+    """Each timeout flavour gets its own stderr advice; exit code stays 2."""
+    from docx_editor.session import EXIT_TIMEOUT
+
+    conn = tmp_path / "kernel.json"
+    start_session(conn)
+    try:
+        code = main(["exec", "import time; time.sleep(30)", "--session-file", str(conn), "--timeout", "2"])
+        assert code == EXIT_TIMEOUT
+        assert "kernel still running" in capsys.readouterr().err
+
+        code = main(["exec", "1 + 1", "--session-file", str(conn), "--timeout", "2"])
+        assert code == EXIT_TIMEOUT
+        err = capsys.readouterr().err
+        assert "still queued" in err
+        assert "never started" in err
+    finally:
+        stop_session(conn)
+
+
+def test_request_discarded_behind_a_raising_command(tmp_path):
+    """An "ok" result with started=False ran NOTHING.
+
+    ipykernel aborts everything still queued behind a command that raises, so a
+    request sent while an earlier one was failing comes back clean and empty
+    having done nothing. Without ``started`` that is indistinguishable from a
+    successful silent statement — the caller would believe its edit applied.
+    """
+    from docx_editor.session import _client
+
+    conn = tmp_path / "kernel.json"
+    start_session(conn)
+    hog = _client(conn)
+    try:
+        hog.execute("import time; time.sleep(3); raise RuntimeError('boom')")
+        time.sleep(0.5)  # let the kernel pick it up and go busy
+
+        res = exec_code("discarded = 'I RAN'", connection_file=conn, timeout=30)
+        assert res.status == "ok"
+        assert res.started is False  # the tell: never dequeued
+        assert res.stdout == ""
+
+        time.sleep(4)  # let the failing command finish and the kernel settle
+        assert eval_code("globals().get('discarded')", connection_file=conn).value is None
+    finally:
+        hog.stop_channels()
+        stop_session(conn)
+
+
+def test_cli_warns_when_the_kernel_discards_the_request(tmp_path, capsys):
+    """Exit code stays 0 (contract), so the warning has to carry the signal."""
+    from docx_editor.session import EXIT_OK, _client
+
+    conn = tmp_path / "kernel.json"
+    start_session(conn)
+    hog = _client(conn)
+    try:
+        hog.execute("import time; time.sleep(3); raise RuntimeError('boom')")
+        time.sleep(0.5)
+
+        code = main(["exec", "discarded = 1", "--session-file", str(conn), "--timeout", "30"])
+        assert code == EXIT_OK
+        assert "discarded this request" in capsys.readouterr().err
+    finally:
+        hog.stop_channels()
+        stop_session(conn)
+
+
+def test_eval_names_the_discard_instead_of_blaming_the_transport(tmp_path, capsys):
+    """A discarded eval has no reply to decode — but that is not a transport
+    fault, and saying so sends the caller debugging the wrong thing."""
+    from docx_editor.session import EXIT_ERROR, _client
+
+    conn = tmp_path / "kernel.json"
+    start_session(conn)
+    hog = _client(conn)
+    try:
+        hog.execute("import time; time.sleep(3); raise RuntimeError('boom')")
+        time.sleep(0.5)
+
+        code = main(["eval", "1 + 1", "--session-file", str(conn), "--timeout", "30"])
+        captured = capsys.readouterr()
+        assert code == EXIT_ERROR
+        assert "discarded this request" in captured.err
+        assert "transport failed" not in captured.err
+        assert captured.out == ""  # no envelope: nothing was evaluated
+    finally:
+        hog.stop_channels()
         stop_session(conn)
 
 
@@ -198,10 +324,18 @@ class TestEval:
         assert "docx-session start" in captured.err
 
     def test_eval_transport_no_result_raises(self, tmp_path, monkeypatch):
-        """A kernel reply with no execute_result is a transport bug, not a user error."""
+        """A kernel reply with no execute_result is a transport bug, not a user error.
+
+        ``started=True`` is what makes it one: the wrapper ran and still produced
+        nothing. The same shape with ``started=False`` means the kernel discarded
+        the request, which gets its own message (see
+        test_eval_names_the_discard_instead_of_blaming_the_transport).
+        """
         from docx_editor import session as session_mod
 
-        monkeypatch.setattr(session_mod, "exec_code", lambda *a, **k: ExecResult(status="ok", result=None))
+        monkeypatch.setattr(
+            session_mod, "exec_code", lambda *a, **k: ExecResult(status="ok", result=None, started=True)
+        )
         with pytest.raises(SessionError, match="returned no result"):
             eval_code("1 + 1", connection_file=tmp_path / "unused.json")
 
