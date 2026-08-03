@@ -1065,6 +1065,16 @@ class Document:
         ``paragraph`` ref with ``group_id=None`` and ``revision_ids=()`` —
         that triple is how callers detect the no-op.
 
+        A replace landing wholly inside your own pending insertion *amends*
+        that insertion: your unsaved text is rewritten in place rather than
+        counter-proposed, whether the match covers part of the insertion or
+        all of it. No revision is created, so the result carries
+        ``group_id=None`` and ``revision_ids=()`` (with an updated ref) — to
+        undo the amendment, reject the group of the insertion it amended:
+        the one holding the end of the match, which keeps its id and its
+        group. A match spanning two of your own adjacent insertions
+        consolidates into that one, dropping any insertion consumed whole.
+
         Args:
             find: Text to find and replace, or a
                 :class:`~docx_editor.track_changes.SearchResult` from
@@ -1412,7 +1422,8 @@ class Document:
             "P2#c3d4"), carrying ``group_id``/``revision_ids`` of all the
             revisions the rewrite created (``group_id`` is None when
             new_text equals the current text, or when every change landed
-            inside your own pending insertions and was merged in place).
+            inside your own pending insertions and amended them in place —
+            undo those by rejecting the group of the amended insertion).
 
         Raises:
             ValueError: If ``new_text`` is not a string (empty string is
