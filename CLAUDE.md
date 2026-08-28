@@ -34,6 +34,46 @@ workers multiply both load and peak memory on a shared machine. CI has its own
 separate settings. Skip `--cov` locally too — it is slow and adds nothing while
 iterating.
 
+## Pull Requests
+
+**Title:** `type: what changed in the code (ISSUES.md #N)` — imperative, under ~72
+chars. Describe the change, not where it came from. No round numbers, batch
+names, phase names, or "as requested".
+
+- ✅ `docs: document the changeset tier and error fields (ISSUES.md #55)`
+- ❌ `docs: SKILL.md round-2 sync + [create] extra` — "round-2" is our process, not the reader's problem
+
+**Body:** four short sections, ~200 words total. Longer only if the change is
+genuinely intricate.
+
+```markdown
+## What
+Behavior before → after, in 1-3 sentences.
+
+## Why
+The user-visible problem this solves.
+
+## How
+The mechanism, only where it is not obvious from the diff. Name the files and
+functions a reviewer should look at first.
+
+## Testing
+What proves it works: test names or counts, and gate results. One line each.
+```
+
+**Rules:**
+
+- **Describe the code, not the process.** No dogfooding rounds, batch numbers,
+  agent workflow, review iterations, planning artifacts, or self-criticism.
+- **A PR describes its final state.** A defect introduced and fixed inside the
+  same branch is not part of that state — do not narrate it. If it produced a
+  regression test, name the test under Testing; that is the part that survives.
+  - ❌ `The 42 GB OOM this PR caused...`
+  - ✅ `Adds a regression test that fails in 0.17s if loop termination regresses.`
+- **Prefer specifics over adjectives.** "1426 passed, peak RSS 133 MiB" beats
+  "comprehensive testing".
+- No emoji, no marketing language, no attribution to any tool or assistant.
+
 ## Code Quality Principles (CRITICAL)
 
 **MANDATORY: These principles are CRITICAL for all code changes.**
