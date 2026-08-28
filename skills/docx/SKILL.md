@@ -499,7 +499,8 @@ import os
 author = os.environ.get("USER") or "Reviewer"
 doc = Document.open("reviewed.docx", author=author)
 
-# List all tracked revisions (returns list[Revision] objects)
+# List the document's tracked insertions and deletions (list[Revision]).
+# Other revision types are not listed here — see list_unhandled_revisions().
 revisions = doc.list_revisions()
 for r in revisions:
     print(f"ID: {r.id}, Type: {r.type}, Author: {r.author}, Text: {r.text}")
@@ -582,11 +583,27 @@ doc.reject_changeset(results[0].changeset_id)   # undo the whole call, or:
 # stored in the document XML and survive save()/close()/reopen — resolving
 # by revision id in a later session is always safe.
 
-# Accept or reject all revisions (returns count of revisions processed)
-doc.accept_all()
+# Accept or reject all insertions and deletions. The return value counts the
+# revisions processed and behaves as that int in comparisons, arithmetic and
+# f-strings; it also carries what could NOT be processed.
+result = doc.accept_all()
 doc.reject_all()
 
-# Accept/reject only specific author's revisions
+# ALWAYS check this before telling a human "all changes accepted", and check
+# the result of THIS call — .unhandled describes the call it came from.
+# accept_all/reject_all resolve w:ins/w:del only. A Word redline whose
+# revisions are format changes (w:pPrChange, w:rPrChange) or drag-and-drop
+# moves (w:moveFrom/w:moveTo) returns 0 — not because there was nothing to
+# do, but because nothing there could be resolved.
+if result.unhandled:
+    print(result.unhandled_types)   # {'w:moveFrom': 8, 'w:moveTo': 8, ...}
+    for row in doc.list_unhandled_revisions():
+        print(f"still pending: {row.tag} by {row.author} @{row.paragraph_ref}")
+    # Report these to the human as STILL PENDING — the document is not fully
+    # adjudicated. An UnhandledRevisionWarning is also emitted.
+
+# Accept/reject only specific author's revisions. On a filtered call
+# .unhandled counts only that author's marks.
 doc.accept_all(author="Reviewer")
 doc.reject_all(author="OtherUser")
 
@@ -616,9 +633,10 @@ nested deletion's `nested_under` points back at its host.
   nested inside it survives as an independent pending deletion.
 - *Rejecting* the insertion removes everything inside it — nested deletions
   disappear with it.
-- `accept_all()` / `reject_all()` resolve nesting fully (they re-scan until no
-  revisions remain), and `author=` filters process each author's changes
-  independently.
+- `accept_all()` / `reject_all()` resolve nesting fully **for insertions and
+  deletions** (they re-scan until no `w:ins`/`w:del` remain), and `author=`
+  filters process each author's changes independently. Other revision types
+  are not resolved at all — see the `result.unhandled` recipe above.
 
 Predict the outcome, then verify with `get_markup_text()`.
 
