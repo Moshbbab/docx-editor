@@ -163,30 +163,103 @@ class CommentManager:
         """
         if not isinstance(anchor_text, str) or not anchor_text:
             raise CommentError(f"anchor_text must be a non-empty string, got {anchor_text!r}")
-        if not isinstance(comment_text, str):
-            # Must fail here, before _place_markers mutates document.xml —
-            # a crash later (html.escape) would leave orphaned range markers.
-            raise CommentError(f"comment_text must be a string, got {comment_text!r}")
-        # Comments carry no split semantics, so reject '\n' too — a literal
-        # newline in a single <w:t> would be an invisible, unreviewable artifact.
+        # Both must be validated here, before _place_markers mutates
+        # document.xml — a crash later (html.escape) would leave orphaned range
+        # markers. Comments carry no split semantics, so '\n' is rejected in
+        # both: in the anchor it could never match, and in the body it would be
+        # an invisible, unreviewable literal.
+        self._validate_comment_text(comment_text, field="comment_text", ctx="add_comment(): ")
         try:
             _reject_control_chars(anchor_text, field="anchor_text", ctx="add_comment(): ", allow_newline=False)
-            _reject_control_chars(comment_text, field="comment_text", ctx="add_comment(): ", allow_newline=False)
         except ValueError as e:
             raise CommentError(str(e)) from e
         _, match = self._locate_anchor(anchor_text, paragraph, occurrence)
 
         comment_id = self.next_comment_id
-        para_id = _generate_hex_id()
-        durable_id = _generate_hex_id()
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         # Place range markers at character-precise positions in document.xml
         self._place_markers(match, comment_id)
 
+        return self._commit_comment(comment_id, comment_text)
+
+    @staticmethod
+    def _validate_comment_text(text: str, *, field: str, ctx: str) -> None:
+        """Reject comment/note text that cannot be written into a comment part.
+
+        One rule for the two element-or-text anchored bodies — ``add_comment``'s
+        ``comment_text`` and ``add_comment_on_elements``' — so they cannot
+        drift: it must be a string, and must carry no control characters
+        (``\\n`` included: a comment body is a single ``<w:t>``, where a literal
+        newline is an invisible, unreviewable artifact). ``reply_to_comment``
+        keeps its own check because a reply may not be empty and reports a
+        wrong type as ``ValueError``, not ``CommentError``.
+
+        Raises:
+            CommentError: If ``text`` is not a string or holds a control character.
+        """
+        if not isinstance(text, str):
+            raise CommentError(f"{field} must be a string, got {text!r}")
+        try:
+            _reject_control_chars(text, field=field, ctx=ctx, allow_newline=False)
+        except ValueError as e:
+            raise CommentError(str(e)) from e
+
+    def add_comment_on_elements(self, first: Element, last: Element, comment_text: str) -> int:
+        """Anchor a comment on the span from ``first`` to ``last`` (document order).
+
+        The element-anchored counterpart of ``add_comment``: the range markers
+        become *siblings* of whole elements instead of being spliced into a run
+        at character offsets. That is what lets a comment bracket a tracked
+        revision — a ``w:del``'s text is not in the accepted text map at all,
+        and an inserted string may repeat in its paragraph, so text search
+        cannot address either one unambiguously.
+
+        ``first`` and ``last`` may be the same element, and may live in
+        different paragraphs (a tracked split); ``w:commentRangeStart`` /
+        ``w:commentRangeEnd`` are range marks, valid anywhere run-level content
+        is.
+
+        Markers sit *outside* the bracketed elements, so rejecting the revision
+        does not carry them away — the caller owns cleanup (see
+        ``Document._reap_note_comments``).
+
+        Args:
+            first: First element of the span; the start marker goes before it.
+            last: Last element of the span; the end marker and the comment
+                reference run go after it.
+            comment_text: The comment content.
+
+        Returns:
+            The comment ID.
+
+        Raises:
+            CommentError: If ``comment_text`` is not a string or holds a
+                control character.
+        """
+        self._validate_comment_text(comment_text, field="comment_text", ctx="add_comment_on_elements(): ")
+
+        comment_id = self.next_comment_id
+        self.document_editor.insert_before(first, self._comment_range_start_xml(comment_id))
+        # _comment_range_end_xml emits the end marker *and* the reference run.
+        self.document_editor.insert_after(last, self._comment_range_end_xml(comment_id))
+        return self._commit_comment(comment_id, comment_text)
+
+    def _commit_comment(self, comment_id: int, comment_text: str, *, parent_para_id: str | None = None) -> int:
+        """Write the four comment parts for an already-placed marker pair.
+
+        The shared tail of every comment creation path — ``add_comment``,
+        ``add_comment_on_elements`` and ``reply_to_comment`` (which passes its
+        parent's ``para_id``): the markers are already in document.xml, this
+        records the body. ``next_comment_id`` moves here and nowhere else, so a
+        note comment and a user comment can never be allocated the same id.
+        """
+        para_id = _generate_hex_id()
+        durable_id = _generate_hex_id()
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
         # Add to all comment XML files
         self._add_to_comments_xml(comment_id, para_id, comment_text, timestamp)
-        self._add_to_comments_extended_xml(para_id, parent_para_id=None)
+        self._add_to_comments_extended_xml(para_id, parent_para_id=parent_para_id)
         self._add_to_comments_ids_xml(para_id, durable_id)
         self._add_to_comments_extensible_xml(durable_id)
 
@@ -436,9 +509,6 @@ class CommentManager:
 
         parent_info = self.existing_comments[parent_comment_id]
         comment_id = self.next_comment_id
-        para_id = _generate_hex_id()
-        durable_id = _generate_hex_id()
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         # Find parent comment markers in document.xml
         parent_start_elem = self.document_editor.get_node(
@@ -448,24 +518,16 @@ class CommentManager:
             tag="w:commentReference", attrs={"w:id": str(parent_comment_id)}
         )
 
-        # Add reply markers after parent markers
-        self.document_editor.insert_after(parent_start_elem, self._comment_range_start_xml(comment_id))
+        self._place_reply_markers(comment_id, parent_start_elem, parent_ref_elem)
 
-        parent_ref_run = parent_ref_elem.parentNode
+        return self._commit_comment(comment_id, reply_text, parent_para_id=parent_info["para_id"])
+
+    def _place_reply_markers(self, comment_id: int, parent_start, parent_ref) -> None:
+        """Seat a reply's markers around its parent's, where Word expects them."""
+        self.document_editor.insert_after(parent_start, self._comment_range_start_xml(comment_id))
+        parent_ref_run = parent_ref.parentNode
         self.document_editor.insert_after(parent_ref_run, f'<w:commentRangeEnd w:id="{comment_id}"/>')
         self.document_editor.insert_after(parent_ref_run, self._comment_ref_run_xml(comment_id))
-
-        # Add to all comment XML files
-        self._add_to_comments_xml(comment_id, para_id, reply_text, timestamp)
-        self._add_to_comments_extended_xml(para_id, parent_para_id=parent_info["para_id"])
-        self._add_to_comments_ids_xml(para_id, durable_id)
-        self._add_to_comments_extensible_xml(durable_id)
-
-        # Track for further replies
-        self.existing_comments[comment_id] = {"para_id": para_id}
-        self.next_comment_id += 1
-
-        return comment_id
 
     def list_comments(self, author: str | None = None) -> list[Comment]:
         """List all comments in the document.
@@ -560,7 +622,12 @@ class CommentManager:
         return False
 
     def delete_comment(self, comment_id: int) -> bool:
-        """Delete a comment from the document.
+        """Delete a comment, and every reply threaded under it, from the document.
+
+        A reply is linked to its parent only by ``w15:paraIdParent``: left
+        behind, it would point at a paraId no part of the document still holds,
+        and its own descendants would become unreachable — so the thread goes
+        as a unit, the way Word deletes one.
 
         Args:
             comment_id: The comment ID to delete
@@ -578,30 +645,12 @@ class CommentManager:
         if comment_id not in self.existing_comments:
             return False
 
+        for reply_id in self.reply_ids(comment_id):
+            self.delete_comment(reply_id)
+
         para_id = self.existing_comments[comment_id]["para_id"]
 
-        # Remove from document.xml
-        try:
-            range_start = self.document_editor.get_node(tag="w:commentRangeStart", attrs={"w:id": str(comment_id)})
-            range_start.parentNode.removeChild(range_start)
-        except Exception:
-            pass
-
-        try:
-            range_end = self.document_editor.get_node(tag="w:commentRangeEnd", attrs={"w:id": str(comment_id)})
-            range_end.parentNode.removeChild(range_end)
-        except Exception:
-            pass
-
-        try:
-            ref = self.document_editor.get_node(tag="w:commentReference", attrs={"w:id": str(comment_id)})
-            # Remove the parent run containing the reference
-            if ref.parentNode and ref.parentNode.nodeName == "w:r":
-                ref.parentNode.parentNode.removeChild(ref.parentNode)
-            else:
-                ref.parentNode.removeChild(ref)
-        except Exception:
-            pass
+        self._remove_range_markers(comment_id)
 
         # Remove from comments.xml
         if self.comments_path.exists():
@@ -619,22 +668,122 @@ class CommentManager:
                     ex_elem.parentNode.removeChild(ex_elem)
                     break
 
-        # Remove from commentsIds.xml
+        # Remove from commentsIds.xml, keeping the durable id it holds — that
+        # entry is the only place the two ids are linked, so the extensible
+        # part can only be found before this element goes.
+        # A comment authored elsewhere whose commentsIds.xml row is missing
+        # leaves no way to reach its extensible entry; that orphan stays.
+        durable_id = None
         if self.comments_ids_path.exists():
             editor = self._get_editor(self.comments_ids_path)
             for id_elem in editor.dom.getElementsByTagName("w16cid:commentId"):
                 if id_elem.getAttribute("w16cid:paraId") == para_id:
+                    durable_id = id_elem.getAttribute("w16cid:durableId")
                     id_elem.parentNode.removeChild(id_elem)
                     break
 
         # Remove from commentsExtensible.xml
-        if self.comments_extensible_path.exists():
-            # Need durable_id, which is in commentsIds.xml - already removed
-            # Just leave it, or we'd need to track durable_id
-            pass
+        if durable_id and self.comments_extensible_path.exists():
+            editor = self._get_editor(self.comments_extensible_path)
+            for ex_elem in editor.dom.getElementsByTagName("w16cex:commentExtensible"):
+                if ex_elem.getAttribute("w16cex:durableId") == durable_id:
+                    ex_elem.parentNode.removeChild(ex_elem)
+                    break
 
         del self.existing_comments[comment_id]
         return True
+
+    def _remove_range_markers(self, comment_id: int) -> None:
+        """Drop a comment's range markers and reference run from document.xml.
+
+        Each lookup is guarded: a marker can already be gone (carried away
+        inside a rejected revision that hosted it), and a comment missing one
+        marker must still lose the others rather than keep a half-range.
+        """
+        for tag in ("w:commentRangeStart", "w:commentRangeEnd"):
+            try:
+                marker = self.document_editor.get_node(tag=tag, attrs={"w:id": str(comment_id)})
+                marker.parentNode.removeChild(marker)
+            except Exception:
+                pass
+
+        try:
+            ref = self.document_editor.get_node(tag="w:commentReference", attrs={"w:id": str(comment_id)})
+            # Remove the parent run containing the reference
+            if ref.parentNode and ref.parentNode.nodeName == "w:r":
+                ref.parentNode.parentNode.removeChild(ref.parentNode)
+            else:
+                ref.parentNode.removeChild(ref)
+        except Exception:
+            pass
+
+    def move_comment_markers(self, comment_id: int, first: Element, last: Element) -> None:
+        """Re-anchor an existing comment's range on the span ``first``..``last``.
+
+        The comment bodies and ids are untouched; the whole thread's range
+        markers move together, because a reply's markers are seated relative to
+        its parent's and would otherwise be stranded at the old anchor. Used
+        when the revisions a note comment was anchored on are resolved while
+        other revisions it explains are still pending: leaving the range behind
+        would point the rationale at text nobody changed.
+        """
+        thread = self._thread(comment_id)
+        for reply_id, _ in thread:
+            self._remove_range_markers(reply_id)
+        self._remove_range_markers(comment_id)
+        self.document_editor.insert_before(first, self._comment_range_start_xml(comment_id))
+        self.document_editor.insert_after(last, self._comment_range_end_xml(comment_id))
+        # Parent-first order, so each reply lands on its own parent's new
+        # markers — the same relative placement reply_to_comment gave it.
+        for reply_id, parent_id in thread:
+            self._place_reply_markers(
+                reply_id,
+                self.document_editor.get_node(tag="w:commentRangeStart", attrs={"w:id": str(parent_id)}),
+                self.document_editor.get_node(tag="w:commentReference", attrs={"w:id": str(parent_id)}),
+            )
+
+    def reply_ids(self, comment_id: int) -> list[int]:
+        """Ids of every comment threaded under ``comment_id``, descendants included.
+
+        A reply is linked to its parent only by ``w15:paraIdParent`` in
+        commentsExtended.xml; deleting the parent alone would leave that
+        attribute pointing at a paraId no part of the document still holds.
+        """
+        return [reply_id for reply_id, _ in self._thread(comment_id)]
+
+    def _thread(self, comment_id: int) -> list[tuple[int, int]]:
+        """``(reply, its parent)`` for the whole thread under ``comment_id``.
+
+        Ordered so a reply always follows the comment it answers, which is what
+        lets ``move_comment_markers`` re-seat each reply on its own parent's
+        freshly placed markers rather than flattening the thread onto the root.
+        """
+        if not self.comments_extended_path.exists():
+            return []
+        para_of_id = {cid: info["para_id"] for cid, info in self.existing_comments.items()}
+        id_of_para = {para_id: cid for cid, para_id in para_of_id.items()}
+        editor = self._get_editor(self.comments_extended_path)
+        children: dict[str, list[int]] = {}
+        for ex_elem in editor.dom.getElementsByTagName("w15:commentEx"):
+            parent_para = ex_elem.getAttribute("w15:paraIdParent")
+            child_id = id_of_para.get(ex_elem.getAttribute("w15:paraId"))
+            if parent_para and child_id is not None:
+                children.setdefault(parent_para, []).append(child_id)
+
+        found: list[tuple[int, int]] = []
+        seen = {comment_id}
+        queue = [comment_id]
+        while queue:
+            current = queue.pop(0)
+            for child_id in children.get(para_of_id.get(current, ""), ()):
+                # A malformed commentsExtended could name the same child twice,
+                # or point a thread back at itself; either would loop forever.
+                if child_id in seen:
+                    continue
+                seen.add(child_id)
+                found.append((child_id, current))
+                queue.append(child_id)
+        return found
 
     def save_all(self) -> None:
         """Save all modified XML files."""
