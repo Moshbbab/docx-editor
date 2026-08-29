@@ -943,6 +943,7 @@ All LLM-facing errors inherit from `DocxEditError` and carry structured fields s
 | `WorkspaceSyncError`   | `workspace_path`, `source_path`                                                         | Workspace and source disagree (unsaved edits from a previous session, or the source changed on disk). **Do not retry blindly** — `force_recreate=True` (open) / `force=True` (save) / `Document.discard_workspace(path)` DISCARDS one side; to rescue the workspace's edits first, save them elsewhere: `Workspace(source, create=False).save("rescued.docx")`. After a crashed script, `Document.discard_workspace(path)` once beats `force_recreate=True` on every open. |
 | `WorkspaceLockedError` | `pid`, `lock_path`                                                                      | A live session already holds this document's workspace — another process, or an unclosed `Document` in THIS one. Close it (or stop that process) and retry; `Document.open(path, force_recreate=True)` or `Document.discard_workspace(path)` takes the workspace over but DISCARDS the holder's unsaved edits — confirm the holder is gone first. Locks left by dead processes are reclaimed automatically and never raise. |
 | `DocumentOpenError`    | `path`, `owner_file`                                                                    | **Do not retry blindly.** The destination is open in Word. Stop and tell the user to close it. Only pass `force=True` if the user confirms the `~$` lock is stale (crashed session). |
+| `DocumentProtectedError` | `path`, `mode`                                                                        | The document enforces Word's *Restrict Editing* with a mode that locks the body text — `mode` is `readOnly`, `forms` or `comments`. **Not an in-loop retry:** the author asked for the content not to be edited, so tell the user, and only pass `Document.open(path, allow_protected=True)` if they confirm it (the protection stays in the saved file; with `mode="comments"`, `add_comment()` is what that mode permits). A document enforcing `trackedChanges`, or one whose protection is switched off, opens normally and never raises — and so does one using Word's *Password to modify* / *Always Open Read-Only* (`w:writeProtection`), which is a different element this guard does not read. |
 
 ```python
 from docx_editor import (
@@ -1008,6 +1009,20 @@ A directory-permission problem surfaces as a plain `PermissionError`, not
 `DocumentOpenError` — do not tell the user to close Word for that one. So does a
 **write-protected document**: `save()` refuses it rather than replacing it, so offer
 to save under a new path instead.
+
+**The track-changes switch.** A save that leaves a revision you authored also turns
+Word's Track Changes switch on in the saved file (`<w:trackRevisions/>` in
+`word/settings.xml`). Your redline is visible either way; the switch is what keeps
+the *recipient's* own typing tracked, so the next round of edits can still be told
+apart from yours. What counts is the document's state, not whether this session
+edited: your own pending redline reopened from an earlier session still turns the
+switch on, because it is still waiting for a reply. Nothing else is touched: a
+document holding no revision of yours — one you did not redline, or one whose
+revisions you accepted — is saved with its settings as they were. Pass `doc.save(path, track_changes=False)` to opt out; it never removes a
+switch the document already had. A document that turns tracking *off* explicitly
+(`<w:trackRevisions w:val="false"/>`) is left exactly as its author configured it and
+the save emits a `UserWarning` saying the recipient's edits will not be tracked —
+if the user wants tracking on anyway, `save(path, track_changes=True)` overrides it.
 
 ### Paragraph Rewrite (Fallback for Structural Edits)
 
@@ -1208,6 +1223,23 @@ If unsure, ask the user: "Should I use Opus (best), Sonnet (recommended) or Haik
 **Editing in parallel**: NOT possible for the same document — the workspace is keyed by the document's absolute path and advisory-locked: while a live session holds it, a second `Document.open()` raises `WorkspaceLockedError` naming the holder's `pid` and `lock_path` (no silent clobbering; the holder can be another process or an unclosed `Document` in this same process). Edit sequentially, or take the workspace over with `Document.open(path, force_recreate=True)` — that DISCARDS the holder's unsaved edits. Locks left by dead processes are reclaimed automatically. Different files never collide (each gets its own workspace), so editing distinct documents in parallel is fine.
 
 ### Limitations
+
+**What this library will not do.** It redlines and reviews documents that already
+exist, and deliberately stops there — so when a request falls outside, reach for
+the right tool instead of asking for a feature that is not coming. **Redaction** is
+a permanent refusal: a tool built to preserve history cannot honestly promise
+removal. **Creating documents and editing structure** — tables, images, styles,
+sections, TOCs, fields, content controls, mail merge — belongs to
+[python-docx](https://python-docx.readthedocs.io/), and format conversion to
+[pandoc](https://pandoc.org/). **Regex find/replace** is out (matching runs over
+text that is deliberately anchored to runs and revisions here), and so is
+**diffing two arbitrary documents**: the version that fits this domain is
+`list_revisions()` plus `get_visible_text()`/`get_original_text()`, and
+`rewrite_paragraph()`'s own word-level diff. There is no **schema validator**
+either — the contract that matters is "opens in Word with zero repair prompts",
+which is tested by round-tripping real documents. Text in shapes and text boxes is
+excluded rather than half-editable, and headers, footers, footnotes and endnotes
+wait for a real demand.
 
 - **Text in shapes/text boxes**: May not be accessible via standard paragraph iteration
 - **Charts**: Text inside charts is embedded in separate XML, not easily editable
