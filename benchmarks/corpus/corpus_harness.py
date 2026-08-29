@@ -4,7 +4,8 @@
 Modes:
   corpus_harness.py                 run all corpus files (parent mode)
   corpus_harness.py --only NAME     run a single file by name (parent mode, filtered)
-  corpus_harness.py --no-pdf        skip the LibreOffice PDF-conversion stage
+  corpus_harness.py --no-soffice    skip the LibreOffice stages (lo_roundtrip, pdf);
+                                    --no-pdf is accepted as an alias
   corpus_harness.py --census        print the revision census only (no library round-trip)
   corpus_harness.py --single PATH   internal: run stages for one file, JSON to stdout
 
@@ -22,7 +23,23 @@ Stages per file:
   reopen          reopen saved file, assert the edit survived and the revision
                   count is coherent, then accept_all
   save2           save to out/<name>_final.docx + zip/XML validation
+  lo_roundtrip    soffice --headless --convert-to docx on the *edited* output,
+                  then assert that what we wrote survived the re-save
   pdf             soffice --headless --convert-to pdf on the final output
+
+The two LibreOffice stages are the closest thing to "opens in Word without a
+repair prompt" that runs on a CI box. Two facts about soffice shape them:
+its exit code is 0 even when it refuses a file (the signal is an "Error:"
+line and a missing output file), and it prints nothing at all for an element
+it does not recognize — it silently drops it on re-save (ISSUES.md #66, PR #77).
+So each stage fails on any Error:/Warning: line soffice prints and on a
+missing output (a nonzero exit after a good output is also a failure, though
+never the signal relied on), and lo_roundtrip additionally reopens the
+re-saved file and checks that our w:trackRevisions flag and our own
+insertion/deletion are still there. Where
+LibreOffice's own model cannot hold our redline (inside a field result,
+inside a foreign move), the manifest records a ``survival_waiver`` with the
+reason; see apply_manifest_expectations.
 
 An input that fails input_validate and is then refused by Document.open is
 recorded as "rejected" (mark: r), not as a failure — refusing an invalid
@@ -38,12 +55,15 @@ evidence base for handling the ones this library does not resolve
 
 import argparse
 import json
+import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
 import traceback
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -51,11 +71,20 @@ FILES_DIR = HERE / "files"
 OUT_DIR = HERE / "out"
 WORK_DIR = HERE / "work"
 PDF_DIR = OUT_DIR / "pdf"
+LO_DIR = OUT_DIR / "lo"
+LO_PROFILE = HERE / "loprofile"
 RESULTS_PATH = HERE / "results.json"
 PER_FILE_TIMEOUT = 60  # seconds, library stages
-PDF_TIMEOUT = 60  # seconds, soffice conversion
+PDF_TIMEOUT = 60  # seconds, soffice pdf conversion
+LO_TIMEOUT = 60  # seconds, soffice docx re-save
+DRAIN_TIMEOUT = 10  # seconds, draining soffice's pipes after a timeout kill
 
-STAGES = ["input_validate", "open", "read", "edit", "save1", "reopen", "save2", "pdf"]
+# Lines soffice prints that say nothing about the document. oosplash prints
+# one of two javaldx warnings on every run of a machine without a JRE (a
+# plain CI runner); the token covers both.
+SOFFICE_NOISE = ("javaldx",)
+
+STAGES = ["input_validate", "open", "read", "edit", "save1", "reopen", "save2", "lo_roundtrip", "pdf"]
 
 
 # --------------------------------------------------------------------------
@@ -250,11 +279,237 @@ def run_census_only(only: str | None) -> int:
 
 
 # --------------------------------------------------------------------------
+# LibreOffice stages
+# --------------------------------------------------------------------------
+
+AUTHOR = "CorpusHarness"
+EDIT_MARKER = "-EDITED"
+CHECKED = "checked"  # the lo_roundtrip record's survival/flag value when the assertion ran
+NO_EDIT = "skipped (no edit)"  # its survival value when the edit stage was skipped
+
+# The survival assertions a manifest ``survival_waiver`` may cover. Only the
+# one where LibreOffice's model kept our text but not our revision: a dropped
+# w:trackRevisions flag or a vanished edit marker is a loss, never a waiver.
+WAIVABLE_ASSERTIONS = frozenset({"AssertOwnRevisionsDropped"})
+
+
+@dataclass
+class SofficeRun:
+    """One ``soffice --convert-to`` invocation, read the only way it can be.
+
+    ``returncode`` is recorded but is not the load signal: soffice exits 0
+    after refusing a file. ``output`` is the file it actually wrote (None if
+    none), ``messages`` the ``Error:``/``Warning:`` lines it printed minus
+    ``SOFFICE_NOISE``, ``raw`` the combined output minus that noise, trimmed,
+    for diagnostics. ``timed_out`` means the process tree was killed at the
+    stage timeout; ``returncode`` is then the kill's and the rest is empty.
+    """
+
+    output: Path | None
+    messages: list[str]
+    returncode: int
+    timed_out: bool
+    raw: str
+
+
+def soffice_noise(line: str) -> bool:
+    return any(noise in line for noise in SOFFICE_NOISE)
+
+
+def soffice_messages(text: str) -> list[str]:
+    """The ``Error:``/``Warning:`` lines in soffice's output, minus known noise."""
+    return [line for line in text.splitlines() if line.startswith(("Error:", "Warning:")) and not soffice_noise(line)]
+
+
+def soffice_convert(soffice: str, src: Path, convert_to: str, outdir: Path, timeout: int) -> SofficeRun:
+    """Convert ``src`` with LibreOffice into ``outdir``; ``convert_to`` is a soffice filter spec.
+
+    ``soffice`` is a wrapper that forks ``soffice.bin``, so the conversion
+    runs in its own session and a timeout kills that whole tree: an orphaned
+    ``soffice.bin`` keeps the profile lock and stalls every later conversion.
+    """
+    ext = convert_to.split(":", 1)[0]
+    output = outdir / f"{src.stem}.{ext}"
+    output.unlink(missing_ok=True)  # a stale file from an earlier run must not pass
+    cmd = [
+        soffice,
+        "--headless",
+        # A real file URL: a space in the path hangs soffice on a bare file://{path}.
+        f"-env:UserInstallation={LO_PROFILE.as_uri()}",
+        "--convert-to",
+        convert_to,
+        "--outdir",
+        str(outdir),
+        str(src),
+    ]
+    # errors="replace": soffice's output is diagnostics, and a stray byte in
+    # it must not raise past the timeout handling below.
+    with subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", start_new_session=True
+    ) as proc:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)  # the session leader's pgid is its pid
+            except OSError:
+                proc.kill()  # no group to kill; the direct child at least must not be waited on alive
+            try:
+                # Drain the pipes; a descendant that left the session could still hold them.
+                proc.communicate(timeout=DRAIN_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                pass
+            proc.wait()  # the direct child is SIGKILLed: reaping it cannot block
+            return SofficeRun(output=None, messages=[], returncode=proc.returncode, timed_out=True, raw="")
+    produced = output if output.exists() and output.stat().st_size > 0 else None
+    combined = stdout + "\n" + stderr
+    return SofficeRun(
+        output=produced,
+        messages=soffice_messages(combined),
+        returncode=proc.returncode,
+        timed_out=False,
+        raw="\n".join(line for line in combined.splitlines() if line.strip() and not soffice_noise(line))[:400],
+    )
+
+
+def local_name(qname: str) -> str:
+    return qname.rsplit(":", 1)[-1]
+
+
+def track_revisions_on(path: Path) -> bool | None:
+    """Is ``w:trackRevisions`` on in a .docx's settings.xml? None if the part is absent.
+
+    A bare ``<w:trackRevisions/>`` is on (that is how Word writes it); an
+    explicit ``val`` is read as ST_OnOff. Element and attribute are matched
+    by local name, whatever prefix the producer used, as the library does
+    when it writes the flag.
+    """
+    from defusedxml import minidom as safe_minidom
+
+    with zipfile.ZipFile(path) as z:
+        if "word/settings.xml" not in z.namelist():
+            return None
+        dom = safe_minidom.parseString(z.read("word/settings.xml"))
+    for node in dom.documentElement.childNodes:
+        if node.nodeType == node.ELEMENT_NODE and local_name(node.tagName) == "trackRevisions":
+            val = next((v for k, v in node.attributes.items() if local_name(k) == "val"), None)
+            return val is None or val.strip().lower() in ("true", "1", "on")
+    return False
+
+
+def survival_check(out1: Path, roundtrip: Path, work: Path, author: str) -> dict:
+    """Did what the library wrote into ``out1`` survive a LibreOffice re-save?
+
+    LibreOffice drops an element it does not recognize without a word — the
+    ISSUES.md #66 defect (an unknown settings element, found in PR #77) was
+    caught only by a hand round-trip. This is that round-trip, automated:
+    the flag we wrote must still be on, and our own insertion + deletion
+    must still be read back as revisions with our author. Existence checks
+    only — LibreOffice may legally merge a deletion that spanned several
+    runs, so counts are not compared. Returns a failure record, or a pass
+    record whose ``flag`` says whether the flag check applied: when the
+    edited file's flag is not on (a producer wrote ``w:val="false"`` and the
+    library preserved it), or the file has no settings part at all (the
+    library saves such a document without adding one), there is nothing for
+    LibreOffice to drop.
+    """
+    flag_on = track_revisions_on(out1)
+    if flag_on:
+        flag = CHECKED
+        if not track_revisions_on(roundtrip):
+            return assert_fail(
+                "AssertTrackRevisionsDropped",
+                "w:trackRevisions was on in the edited file but is absent or off after the LibreOffice re-save",
+            )
+    elif flag_on is None:
+        flag = "not applicable (no settings part in the edited file)"
+    else:
+        flag = "not applicable (not on in the edited file)"
+    from docx_editor import Document
+
+    doc = Document.open(roundtrip, author=author, workspace_dir=work, force_recreate=True)
+    try:
+        if EDIT_MARKER not in doc.get_visible_text():
+            return assert_fail(
+                "AssertEditMarkerLostInRoundtrip",
+                "edit marker missing from visible text after the LibreOffice re-save",
+            )
+        kinds = {rev.type for rev in doc.list_revisions(author=author)}
+        missing = [kind for kind in ("insertion", "deletion") if kind not in kinds]
+        if missing:
+            return assert_fail(
+                "AssertOwnRevisionsDropped",
+                f"no {' or '.join(missing)} by {author} after the LibreOffice re-save",
+            )
+    finally:
+        doc.close(cleanup=True)
+    return {"status": "pass", "survival": CHECKED, "flag": flag}
+
+
+# Error types: ``Lo*`` names are LibreOffice-side failures — shared by both
+# stages (LoMessage, LoNonzeroExit, SofficeSpawnFailed) or, for LoLoadRefused
+# and LoOutputInvalid, raised only by lo_roundtrip; ``LoRoundtrip*`` and
+# ``Pdf*`` names carry their stage explicitly.
+
+
+def run_lo_roundtrip(out1: Path, edited: bool, soffice: str | None, work: Path) -> dict:
+    """Stage lo_roundtrip: re-save the edited output through LibreOffice and check survival."""
+    if soffice is None:
+        return {"status": "skip", "reason": "soffice not found"}
+    try:
+        run = soffice_convert(soffice, out1, "docx:MS Word 2007 XML", LO_DIR, LO_TIMEOUT)
+    except OSError as e:  # a soffice on PATH that cannot be started (half-removed install)
+        return assert_fail("SofficeSpawnFailed", str(e)[:400])
+    if run.timed_out:
+        return assert_fail("LoRoundtripTimeout", "")
+    if run.messages:
+        return assert_fail("LoMessage", "; ".join(run.messages)[:400])
+    if run.output is None:
+        return assert_fail("LoLoadRefused", run.raw or "no docx produced")
+    if run.returncode != 0:
+        return assert_fail("LoNonzeroExit", nonzero_exit_message(run, "docx"))
+    v = validate_docx(run.output)
+    if not v["ok"]:
+        # LibreOffice's output, not ours: named apart from save1/save2's OutputValidation.
+        return assert_fail("LoOutputInvalid:" + v["error_type"], v["error"][:400])
+    if not edited:
+        return {"status": "pass", "survival": NO_EDIT}
+    try:
+        return survival_check(out1, run.output, work, AUTHOR)
+    except Exception as e:
+        return err_record(e)
+
+
+def run_pdf(out2: Path, soffice: str | None) -> dict:
+    """Stage pdf: render the final output with LibreOffice."""
+    if soffice is None:
+        return {"status": "skip", "reason": "soffice not found"}
+    try:
+        run = soffice_convert(soffice, out2, "pdf", PDF_DIR, PDF_TIMEOUT)
+    except OSError as e:
+        return assert_fail("SofficeSpawnFailed", str(e)[:400])
+    if run.timed_out:
+        return assert_fail("PdfConversionTimeout", "")
+    if run.messages:
+        return assert_fail("LoMessage", "; ".join(run.messages)[:400])
+    if run.output is None:
+        return assert_fail("PdfConversionFailed", run.raw or "no pdf produced")
+    if run.returncode != 0:
+        return assert_fail("LoNonzeroExit", nonzero_exit_message(run, "pdf"))
+    return {"status": "pass"}
+
+
+def nonzero_exit_message(run: SofficeRun, ext: str) -> str:
+    """The exit code is this failure's only signal, so it is always in the message."""
+    return (f"exit {run.returncode} after writing the {ext}" + (f": {run.raw}" if run.raw else ""))[:400]
+
+
+# --------------------------------------------------------------------------
 # Single-file mode (runs inside the timeout subprocess)
 # --------------------------------------------------------------------------
 
 
-def run_single(path: Path, do_pdf: bool) -> dict:
+def run_single(path: Path, do_soffice: bool) -> dict:
     name = path.name
     stages: dict[str, dict] = {}
     result = {"file": name, "stages": stages}
@@ -283,7 +538,7 @@ def run_single(path: Path, do_pdf: bool) -> dict:
     # not a failure — that is the correct behavior for such a document.
     doc = None
     try:
-        doc = Document.open(path, author="CorpusHarness", workspace_dir=work, force_recreate=True)
+        doc = Document.open(path, author=AUTHOR, workspace_dir=work, force_recreate=True)
         stages["open"] = {"status": "pass"}
     except Exception as e:
         rec = err_record(e)
@@ -317,7 +572,7 @@ def run_single(path: Path, do_pdf: bool) -> dict:
         else:
             word = target.text.split()[0]
             try:
-                doc.replace(word, word + "-EDITED", paragraph=target.ref, occurrence=0)
+                doc.replace(word, word + EDIT_MARKER, paragraph=target.ref, occurrence=0)
                 # One logical replace yields >= 2 element-level revisions: one
                 # w:del per source run the text spans, plus the w:ins
                 # (grouping them is ISSUES.md #37). The exact count is recorded
@@ -371,9 +626,9 @@ def run_single(path: Path, do_pdf: bool) -> dict:
     doc2 = None
     try:
         try:
-            doc2 = Document.open(out1, author="CorpusHarness", workspace_dir=work, force_recreate=True)
+            doc2 = Document.open(out1, author=AUTHOR, workspace_dir=work, force_recreate=True)
             if edited:
-                if "-EDITED" not in doc2.get_visible_text():
+                if EDIT_MARKER not in doc2.get_visible_text():
                     stages["reopen"] = assert_fail(
                         "AssertEditMarkerLost",
                         "edit marker missing from visible text after reopen",
@@ -396,7 +651,7 @@ def run_single(path: Path, do_pdf: bool) -> dict:
                 )
                 fail_rest("reopen")
                 return result
-            if edited and "-EDITED" not in doc2.get_visible_text():
+            if edited and EDIT_MARKER not in doc2.get_visible_text():
                 stages["reopen"] = assert_fail(
                     "AssertEditMarkerLostAfterAccept",
                     "edit marker missing from visible text after accept_all",
@@ -434,49 +689,65 @@ def run_single(path: Path, do_pdf: bool) -> dict:
             except Exception:
                 pass
 
-    # Stage 7: PDF conversion of the final output
-    if not do_pdf:
-        stages["pdf"] = {"status": "skip", "reason": "--no-pdf"}
+    # Stages 7-8: LibreOffice. lo_roundtrip re-saves the *edited* output (our
+    # pending redline + the w:trackRevisions flag) and checks it survived;
+    # pdf renders the *final* output. Both skip together.
+    if not do_soffice:
+        stages["lo_roundtrip"] = {"status": "skip", "reason": "--no-soffice"}
+        stages["pdf"] = {"status": "skip", "reason": "--no-soffice"}
         return result
     soffice = shutil.which("soffice")
-    if soffice is None:
-        stages["pdf"] = {"status": "skip", "reason": "soffice not found"}
-        return result
-    profile = HERE / "loprofile"
-    pdf_path = PDF_DIR / f"{out2.stem}.pdf"
-    pdf_path.unlink(missing_ok=True)
-    try:
-        proc = subprocess.run(
-            [
-                soffice,
-                "--headless",
-                f"-env:UserInstallation=file://{profile}",
-                "--convert-to",
-                "pdf",
-                "--outdir",
-                str(PDF_DIR),
-                str(out2),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=PDF_TIMEOUT,
-        )
-        if proc.returncode == 0 and pdf_path.exists() and pdf_path.stat().st_size > 0:
-            stages["pdf"] = {"status": "pass"}
-        else:
-            stages["pdf"] = {
-                "status": "fail",
-                "error_type": "PdfConversionFailed",
-                "error": (proc.stderr or proc.stdout or "no pdf produced")[:400],
-            }
-    except subprocess.TimeoutExpired:
-        stages["pdf"] = {"status": "fail", "error_type": "PdfConversionTimeout", "error": ""}
+    # Independent artifacts: a dropped element in the edited file says
+    # nothing about whether the final file renders, so pdf runs regardless.
+    stages["lo_roundtrip"] = run_lo_roundtrip(out1, edited, soffice, WORK_DIR / f"{path.stem}_lo")
+    stages["pdf"] = run_pdf(out2, soffice)
     return result
 
 
 # --------------------------------------------------------------------------
 # Parent mode
 # --------------------------------------------------------------------------
+
+
+def apply_manifest_expectations(rec: dict) -> None:
+    """Enforce the per-file expectations the manifest records, in place.
+
+    ``must_reject``: the library must refuse the file (e.g. external XML
+    entities); accepting it is a failure. A genuine open failure already
+    counts as failed and keeps its own diagnostics.
+
+    ``survival_waiver``: a documented reason why LibreOffice cannot keep our
+    redline in *this* file (a redline inside a field result, inside a foreign
+    move, ...). The survival assertion is then reported as a skip with that
+    reason — never as a pass — and a waiver that turns out to be unnecessary
+    (everything survived) is itself a failure, so the manifest cannot quietly
+    outlive the LibreOffice behavior it describes. Only ``WAIVABLE_ASSERTIONS``
+    are waived: a refused load, an Error: line, a nonzero exit, a dropped
+    w:trackRevisions flag, or a vanished edit marker still fails.
+    """
+    prov = rec["provenance"]
+    stages = rec["stages"]
+    if prov.get("must_reject") and stages.get("open", {}).get("status") == "pass":
+        stages["open"] = {
+            "status": "fail",
+            "error_type": "MustRejectViolation",
+            "error": "manifest marks this file must_reject, but Document.open accepted it",
+        }
+    waiver = prov.get("survival_waiver")
+    lo = stages.get("lo_roundtrip", {})
+    if waiver and lo.get("status") == "fail" and lo.get("error_type") in WAIVABLE_ASSERTIONS:
+        stages["lo_roundtrip"] = {
+            "status": "skip",
+            "reason": f"survival waived: {waiver}",
+            "dropped": lo["error_type"],
+        }
+    elif waiver and lo.get("status") == "pass" and lo.get("survival") == CHECKED:
+        stages["lo_roundtrip"] = {
+            "status": "fail",
+            "error_type": "StaleSurvivalWaiver",
+            "error": "manifest waives survival for this file, but everything survived the "
+            "LibreOffice re-save — remove the waiver",
+        }
 
 
 def file_failed(rec: dict) -> bool:
@@ -490,10 +761,13 @@ def file_failed(rec: dict) -> bool:
     )
 
 
-def run_all(only: str | None, do_pdf: bool) -> int:
-    OUT_DIR.mkdir(exist_ok=True)
-    PDF_DIR.mkdir(exist_ok=True)
-    WORK_DIR.mkdir(exist_ok=True)
+def make_dirs() -> None:
+    for d in (OUT_DIR, PDF_DIR, LO_DIR, WORK_DIR):
+        d.mkdir(exist_ok=True)
+
+
+def run_all(only: str | None, do_soffice: bool) -> int:
+    make_dirs()
 
     # Loaded unconditionally: must_reject enforcement lives in the manifest,
     # and a missing manifest must not silently disable it.
@@ -509,13 +783,17 @@ def run_all(only: str | None, do_pdf: bool) -> int:
             print(f"no corpus files in {FILES_DIR} — run build_corpus.py first", file=sys.stderr)
         return 1
 
-    timeout = PER_FILE_TIMEOUT + (PDF_TIMEOUT if do_pdf else 0)
+    # Budget every stage timeout plus the drain after each soffice kill, with
+    # slack, so a child whose last stage timed out still reports that stage
+    # instead of being killed mid-report.
+    soffice_budget = LO_TIMEOUT + PDF_TIMEOUT + 2 * DRAIN_TIMEOUT if do_soffice else 0
+    timeout = PER_FILE_TIMEOUT + soffice_budget + 10
     results = []
     for i, f in enumerate(files, 1):
         t0 = time.time()
         cmd = [sys.executable, str(Path(__file__).resolve()), "--single", str(f)]
-        if not do_pdf:
-            cmd.append("--no-pdf")
+        if not do_soffice:
+            cmd.append("--no-soffice")
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
             if proc.returncode == 0 and proc.stdout.strip():
@@ -548,17 +826,8 @@ def run_all(only: str | None, do_pdf: bool) -> int:
                 "stages": {"harness": {"status": "fail", "error_type": type(e).__name__, "error": str(e)}},
             }
         rec["duration_s"] = round(time.time() - t0, 1)
-        prov = manifest.get(f.name, {})
-        rec["provenance"] = prov
-        # A file the manifest marks must_reject (e.g. external XML entities)
-        # must be refused by the library; accepting it is a failure. A genuine
-        # open failure already counts as failed and keeps its own diagnostics.
-        if prov.get("must_reject") and rec["stages"].get("open", {}).get("status") == "pass":
-            rec["stages"]["open"] = {
-                "status": "fail",
-                "error_type": "MustRejectViolation",
-                "error": "manifest marks this file must_reject, but Document.open accepted it",
-            }
+        rec["provenance"] = manifest.get(f.name, {})
+        apply_manifest_expectations(rec)
         results.append(rec)
         # Rewrite results after every file so a killed run keeps partial
         # diagnostics; write-then-replace so a kill mid-write can't truncate it.
@@ -614,14 +883,35 @@ def print_summary(results: list[dict]) -> None:
     print(f"\n{clean}/{len(results)} files fully clean (all stages pass/skip)")
     if rejected:
         print(f"{rejected} rejected (invalid input refused by the library — not a failure)")
+    print_survival_summary(results)
     print_census(results)
+
+
+def print_survival_summary(results: list[dict]) -> None:
+    """How many files the lo_roundtrip survival assertion actually ran on."""
+    lo = [r["stages"].get("lo_roundtrip", {}) for r in results]
+    checked = [s for s in lo if s.get("survival") == CHECKED]
+    flag_na = sum(1 for s in checked if s.get("flag") != CHECKED)
+    no_edit = sum(1 for s in lo if s.get("survival") == NO_EDIT)
+    waived = sum(1 for s in lo if s.get("status") == "skip" and "dropped" in s)
+    if checked or no_edit or waived:
+        print(
+            f"lo_roundtrip survival: {len(checked)} checked ({flag_na} with the flag not applicable), "
+            f"{no_edit} skipped (no edit), {waived} waived"
+        )
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--single", type=Path, help="internal: run one file, JSON to stdout")
     ap.add_argument("--only", help="filter corpus files by substring")
-    ap.add_argument("--no-pdf", action="store_true", help="skip soffice PDF stage")
+    ap.add_argument(
+        "--no-soffice",
+        "--no-pdf",
+        dest="no_soffice",
+        action="store_true",
+        help="skip the LibreOffice stages (lo_roundtrip, pdf); --no-pdf is an alias",
+    )
     ap.add_argument("--census", action="store_true", help="print the revision census only")
     args = ap.parse_args()
 
@@ -629,12 +919,10 @@ def main() -> None:
         sys.exit(run_census_only(args.only))
 
     if args.single:
-        OUT_DIR.mkdir(exist_ok=True)
-        PDF_DIR.mkdir(exist_ok=True)
-        WORK_DIR.mkdir(exist_ok=True)
-        print(json.dumps(run_single(args.single, do_pdf=not args.no_pdf)))
+        make_dirs()
+        print(json.dumps(run_single(args.single, do_soffice=not args.no_soffice)))
         return
-    failures = run_all(args.only, do_pdf=not args.no_pdf)
+    failures = run_all(args.only, do_soffice=not args.no_soffice)
     sys.exit(1 if failures else 0)
 
 
