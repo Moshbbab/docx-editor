@@ -121,11 +121,28 @@ Get the path to this document's workspace folder. Since the workspace lives in t
 print(doc.workspace_path)  # Path("/home/you/.cache/docx-editor/0bebafb463a87cfa")
 ```
 
+#### `has_textbox_content`
+
+Whether any paragraph is hidden inside a drawing's text box (`w:txbxContent`).
+
+Text boxes are not an editing surface: their paragraphs are absent from every listing, their text from every view, search and hash. That makes an all-text-box document — a poster, a flyer, a certificate — read as blank, which is indistinguishable from a genuinely empty document without this flag. Exactly the complement of the paragraph exclusion: `True` means at least one `<w:p>` was excluded, so any text those paragraphs carry is not reachable from here. To read it, go through HTML — `soffice --headless --convert-to html file.docx` then `pandoc file.html -t plain` — rather than reporting the document as empty; pandoc may render a `[ShapeN]` label beside a box's text, from the placeholder LibreOffice exports for a named shape — ignore those. Its `txt:Text` filter and pandoc reading the `.docx` directly both drop text boxes silently.
+
+**Returns:** `True` if any paragraph was excluded as text-box content (bool)
+
+**Example:**
+
+```python
+if not doc.get_visible_text().strip() and doc.has_textbox_content:
+    print("Text lives in text boxes — not editable through refs")
+```
+
 ### Track Changes Methods
 
 #### `paragraph_count()`
 
 Return the total number of paragraphs in the document. A cheap bounds check for pagination — avoids building the full `list_paragraphs()` result just to learn the count.
+
+Paragraphs inside a drawing's text box (`w:txbxContent`) are not counted — text boxes are excluded from the ref index space entirely, so no ref ever addresses one. A document whose content lives only in text boxes therefore counts just the host paragraphs its boxes are anchored in; check [`has_textbox_content`](#has_textbox_content) before reporting it as empty.
 
 **Returns:** Total number of paragraphs (the highest valid 1-based ref index).
 
@@ -137,7 +154,7 @@ count = doc.paragraph_count()
 
 #### `list_paragraphs(max_chars=80, *, start=1, limit=200)`
 
-List paragraphs with hash-anchored references. Refs are **1-based global** indexes (`P1`, `P2`, …) and stay correct across pages — a slice starting at paragraph 51 emits `P51#…`, not `P1#…`.
+List paragraphs with hash-anchored references. Refs are **1-based global** indexes (`P1`, `P2`, …) and stay correct across pages — a slice starting at paragraph 51 emits `P51#…`, not `P1#…`. Text-box content is excluded, as it is from [`paragraph_count()`](#paragraph_count).
 
 **Changed in 0.6.1:** a bare call now returns at most 200 paragraphs (previously all of them). Whenever paragraphs remain beyond the returned window — default or explicit `limit` — the last list entry is a **truncation notice** instead of a paragraph, e.g. `"... 50 more paragraphs; use start=201 or limit=None"`. Notice lines always start with `...` and never match the `P{index}#{hash}` ref shape; filter them with `entry.startswith("...")` when consuming entries as refs. Pass `limit=None` for the full, notice-free listing.
 
@@ -213,7 +230,7 @@ Report whether a paragraph lives in the document body or inside a table cell, wh
 
 - `ref` (str): Paragraph reference from `list_paragraphs()`, such as `P2#f3c1`
 
-**Returns:** `ParagraphLocation`. `location.in_table` is `False` for body paragraphs; `True` when the paragraph is inside a `<w:tc>` cell, in which case `location.table` carries the 1-based table index, row, `w:gridSpan`-aware logical column, and nesting depth. `location.list` is a `ListItem(num_id, ilvl)` for list paragraphs, `None` otherwise: a direct `w:pPr/w:numPr` wins when present — including Word's `numId=0` "numbering disabled" marker, which reports `None` with no style fallback — otherwise the numbering defined by the paragraph's style applies, with `w:basedOn` inheritance chains resolved. Rendered display numbers (e.g. "7.2(a)") are not computed.
+**Returns:** `ParagraphLocation`. `location.in_table` is `False` for body paragraphs; `True` when the paragraph is inside a `<w:tc>` cell, in which case `location.table` carries the 1-based table index (body tables only — a table inside a text box is not counted), row, `w:gridSpan`-aware logical column, and nesting depth. `location.list` is a `ListItem(num_id, ilvl)` for list paragraphs, `None` otherwise: a direct `w:pPr/w:numPr` wins when present — including Word's `numId=0` "numbering disabled" marker, which reports `None` with no style fallback — otherwise the numbering defined by the paragraph's style applies, with `w:basedOn` inheritance chains resolved. Rendered display numbers (e.g. "7.2(a)") are not computed.
 
 `location.style` is the raw `w:pStyle` style id (e.g. `"Heading1"`), `None` when the paragraph carries no explicit style — no name resolution against `word/styles.xml`. `location.outline_level` is the 0-based outline level (`0` == Heading 1, so a document heading level is `outline_level + 1`): a direct `w:outlineLvl` on the paragraph wins, and the spec's `w:val="9"` marker means body text (`None`); otherwise the level defined by the paragraph's style applies, with `w:basedOn` inheritance chains resolved. `location.heading_path` is the chain of nearest preceding headings that contains the paragraph, outermost first (e.g. `("Chapter one", "Termination")`), built from each heading's current visible text; a heading's own path lists only its ancestors, never itself. Headings inside table cells participate in document order. `location.section` is the paragraph's 1-based section index: a paragraph carrying a direct `w:pPr/w:sectPr` closes a section and belongs to the section it closes, the next paragraph starts the following one, and the body-level `w:sectPr` defines the final section — single-section documents report `1` everywhere.
 
@@ -234,7 +251,7 @@ print(f"section {loc.section}")
 
 #### `list_paragraph_locations()`
 
-Batch counterpart to `get_paragraph_location()`: pair every paragraph with its structural location in one pass, precomputing table indexes, style outline levels, style numbering, heading paths, and section indexes once instead of rescanning the document per ref.
+Batch counterpart to `get_paragraph_location()`: pair every paragraph with its structural location in one pass, precomputing table indexes, style outline levels, style numbering, heading paths, and section indexes once instead of rescanning the document per ref. Text-box content is excluded, as it is from [`paragraph_count()`](#paragraph_count).
 
 **Returns:** List of `(ref, ParagraphLocation)` tuples in document order, where `ref` is the same `P{index}#{hash}` token emitted by `list_paragraphs()`. Each location carries the same table, list, style, outline-level, heading-path, and section info as `get_paragraph_location()`.
 
@@ -253,7 +270,7 @@ for ref, loc in doc.list_paragraph_locations():
 
 #### `get_visible_text()`
 
-Get flattened visible document text. Inserted text is included and deleted text is excluded.
+Get flattened visible document text. Inserted text is included and deleted text is excluded. Text inside a drawing's text box is excluded too — it belongs to the box, not to any addressable paragraph. A document whose content lives entirely in text boxes therefore returns nothing but the separators between its host paragraphs; check [`has_textbox_content`](#has_textbox_content) before reporting it as empty.
 
 **Returns:** Visible text with paragraphs separated by newlines (str)
 
@@ -265,7 +282,7 @@ text = doc.get_visible_text()
 
 #### `get_original_text()`
 
-Get flattened original (pre-revision) document text. Deleted text is included and inserted text is excluded — the inverse of `get_visible_text()`. For intra-paragraph revisions this equals what `get_visible_text()` would return after `reject_all()`, without modifying the document (paragraph-level revisions such as inserted paragraph marks only affect line boundaries). Read-only: paragraph references and editing operations keep working on the visible view.
+Get flattened original (pre-revision) document text. Deleted text is included and inserted text is excluded — the inverse of `get_visible_text()`. For intra-paragraph revisions this equals what `get_visible_text()` would return after `reject_all()`, without modifying the document (paragraph-level revisions such as inserted paragraph marks only affect line boundaries). Text inside a drawing's text box is excluded, exactly as in `get_visible_text()`. Read-only: paragraph references and editing operations keep working on the visible view.
 
 **Returns:** Original text with paragraphs separated by newlines (str)
 
@@ -277,7 +294,7 @@ text = doc.get_original_text()
 
 #### `find_text(text, occurrence=0, paragraph=None)`
 
-Find text in the document, including text spanning XML element boundaries.
+Find text in the document, including text spanning XML element boundaries. Text-box content is excluded, as it is from [`paragraph_count()`](#paragraph_count).
 
 **Parameters:**
 
@@ -304,7 +321,7 @@ if match:
 
 Find every match of `text`, in document order. One call replaces the N+1
 `find_text` probes needed to enumerate N hits, and each result carries exactly
-what a follow-up edit needs.
+what a follow-up edit needs. Text-box content is excluded, as it is from [`paragraph_count()`](#paragraph_count).
 
 **Parameters:**
 
@@ -336,7 +353,7 @@ themselves, e.g. `"aa"` in `"aaaa"`.)
 
 #### `count_matches(text)`
 
-Count visible text matches across the document.
+Count visible text matches across the document. Text-box content is excluded, as it is from [`paragraph_count()`](#paragraph_count).
 
 **Parameters:**
 
@@ -691,7 +708,7 @@ new_refs = doc.batch_rewrite([
 Add a comment anchored to specific text. Anchors are located with the same
 visible-text search used by `count_matches()` and the tracked-change edit
 methods, so anchors that span `w:t` run boundaries (formatting changes,
-smart-quote splits, `w:ins` wrappers) are found.
+smart-quote splits, `w:ins` wrappers) are found. Text-box content is excluded, as it is from [`paragraph_count()`](#paragraph_count).
 
 **Parameters:**
 
@@ -1212,10 +1229,10 @@ from docx_editor import Revision
 | `author` | str | The revision author |
 | `date` | datetime or None | When the revision was made |
 | `text` | str | The inserted or deleted text |
-| `paragraph_ref` | str or None | Hash-anchored reference (`"P{i}#{hash}"`) of the containing paragraph; None when the revision sits outside any `<w:p>` (e.g. a `<w:trPr>` row marker) |
-| `occurrence` | int or None | 0-based occurrence index of `text` within the containing paragraph, counted in the view where the revision's text lives (the visible view for insertions, the original pre-revision view for deletions). For insertions it plugs directly into the `occurrence=` parameter of the anchor APIs; None whenever targeting-by-text does not apply (empty text, a host insertion partly consumed by a nested deletion, or a nested deletion) |
+| `paragraph_ref` | str or None | Hash-anchored reference (`"P{i}#{hash}"`) of the containing paragraph; None when the revision sits in no addressable paragraph — outside any `<w:p>` (e.g. a `<w:trPr>` row marker), or inside a drawing's text box — still listed, and `accept_all()`/`reject_all()` always resolve it. Anything narrower depends on how the box is stored: Word normally writes a box twice (an `mc:Choice` copy and an `mc:Fallback` copy), so the revision is listed once per copy and one `accept_revision()`/`accept_group()` call resolves only the copy it lands on. Copies with distinct ids and identical author/date join one inferred changeset, which `accept_changeset()` resolves — along with every other group carrying that author and the identical raw `w:date` string. Copies sharing a `w:id` are ungroupable (`group_id` and `changeset_id` both None), so no group- or changeset-keyed call can reach them and `accept_all()`/`reject_all()` is the single call that takes both |
+| `occurrence` | int or None | 0-based occurrence index of `text` within the containing paragraph, counted in the view where the revision's text lives (the visible view for insertions, the original pre-revision view for deletions). For insertions it plugs directly into the `occurrence=` parameter of the anchor APIs; None whenever targeting-by-text does not apply (empty text, a host insertion partly consumed by a nested deletion, a nested deletion, or a None `paragraph_ref`) |
 | `nested_under` | int or None | id of the nearest enclosing revision (e.g. a foreign deletion inside another author's pending insertion), else None |
-| `contains_ids` | tuple[int, ...] | ids of the revisions nested inside this one, in document order (empty tuple when none) |
+| `contains_ids` | tuple[int, ...] | ids of the revisions nested inside this one, in document order (empty tuple when none). Both nesting fields report *structural* containment and so, unlike `text`, still cross into a text box — accepting a host insertion does not resolve the box's own revisions |
 | `group_id` | int or None | Revision group this revision belongs to (see [`accept_group()`](#accept_groupgroup_id)): recorded for this session's edits, inferred by reconstruction for revisions already in the file; None only for ungroupable revisions (missing author/date, outside any paragraph, duplicated id, or a mid-session split half of a foreign insertion) |
 | `group_source` | str or None | Provenance of `group_id`: `"recorded"` (created through this open Document) or `"inferred"` (reconstructed at parse time from same-paragraph contiguity + identical author and date); None iff `group_id` is None |
 | `changeset_id` | int or None | Changeset (one whole call) this revision's group belongs to (see [`accept_changeset()`](#accept_changesetchangeset_id) / [`reject_changeset()`](#reject_changesetchangeset_id)) — the `(author, date)` class over groups; None iff `group_id` is None |
@@ -1401,7 +1418,7 @@ from docx_editor import UnhandledRevision
 | `id` | int or None | The element's `w:id`, or None when it carries none or a non-numeric one. Unlike `Revision`, an id-less mark is still listed — nothing here is targeted by id. |
 | `author` | str | `w:author`, or `"Unknown"` when the attribute is absent — matching `Revision`. `w:tblGridChange` and the range `*End` marks carry only `w:id` in the schema, so they always read as `"Unknown"`. |
 | `date` | datetime or None | Parsed `w:date`, or None when absent or unparseable |
-| `paragraph_ref` | str or None | Hash-anchored ref of the containing `<w:p>`, or None when the mark sits outside any paragraph (e.g. a `w:tblPrChange` in a table's properties, or a `w:sectPrChange` in a section break) |
+| `paragraph_ref` | str or None | Hash-anchored ref of the containing `<w:p>`, or None when the mark sits in no addressable paragraph — outside any paragraph (e.g. a `w:tblPrChange` in a table's properties, or a `w:sectPrChange` in a section break), or inside a drawing's text box (where a mark is listed once per stored copy, exactly as `Revision` is) |
 
 ### Example
 

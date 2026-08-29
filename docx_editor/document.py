@@ -38,6 +38,7 @@ from .track_changes import (
 )
 from .workspace import Workspace
 from .xml_editor import (
+    _TEXTBOX_CONTENT,
     DocxXMLEditor,
     ListItem,
     ParagraphInfo,
@@ -50,6 +51,8 @@ from .xml_editor import (
     _compute_heading_paths,
     _compute_paragraph_location,
     _compute_section_indexes,
+    _is_inside_element,
+    body_paragraphs,
     build_text_map,
     compute_paragraph_hash,
 )
@@ -450,6 +453,31 @@ class Document:
         """
         return self._workspace.workspace_path
 
+    @property
+    def has_textbox_content(self) -> bool:
+        """Whether any paragraph is hidden inside a drawing's text box.
+
+        Text boxes are not an editing surface: their paragraphs are absent
+        from every listing, their text from every view, search and hash (see
+        :func:`~docx_editor.xml_editor.body_paragraphs`). That makes an
+        all-text-box document — a poster, a flyer, a certificate — read as
+        blank, which is indistinguishable from a genuinely empty document
+        without this flag.
+
+        Exactly the complement of what ``body_paragraphs`` drops: True means
+        at least one ``w:p`` was excluded, so any text those paragraphs carry
+        is not reachable from here. To read it, go through HTML —
+        ``soffice --headless --convert-to html file.docx`` then
+        ``pandoc file.html -t plain`` — rather than reporting the document
+        as empty; pandoc may render a ``[ShapeN]`` label beside a box's text,
+        from the placeholder LibreOffice exports for a named shape — ignore
+        those. Its ``txt:Text`` filter and
+        pandoc reading the ``.docx`` directly both drop text boxes silently.
+        """
+        self._ensure_open()
+        dom = self._document_editor.dom
+        return any(_is_inside_element(p, _TEXTBOX_CONTENT) for p in dom.getElementsByTagName("w:p"))
+
     # ==================== Track Changes API ====================
 
     def find_text(self, text: str, occurrence: int = 0, paragraph: str | None = None) -> SearchResult | None:
@@ -576,15 +604,14 @@ class Document:
         self._ensure_open()
         return self._revision_manager.count_matches(text)
 
-    def _compute_new_ref(self, old_ref: str, paragraphs: list[Element] | None = None) -> str:
+    def _compute_new_ref(self, old_ref: str, paragraphs: list[Element]) -> str:
         """Compute a fresh paragraph reference after mutation.
 
-        ``paragraphs`` is an optional pre-fetched <w:p> list so batch callers
-        pay for one full-DOM walk per batch; None fetches fresh.
+        ``paragraphs`` is the caller's body-paragraph snapshot (see
+        :func:`~docx_editor.xml_editor.body_paragraphs`), so a batch pays for
+        one full-DOM walk rather than one per result.
         """
         ref = ParagraphRef.parse(old_ref)
-        if paragraphs is None:
-            paragraphs = self._document_editor.dom.getElementsByTagName("w:p")
         p = paragraphs[ref.index - 1]
         new_hash = compute_paragraph_hash(p)
         return f"P{ref.index}#{new_hash}"
@@ -601,7 +628,7 @@ class Document:
         revision_ids = self._revision_manager.group_revisions(group_id) if group_id is not None else ()
         changeset_id = self._revision_manager.changeset_id_of(group_id) if group_id is not None else None
         if paragraphs is None:
-            paragraphs = self._document_editor.dom.getElementsByTagName("w:p")
+            paragraphs = body_paragraphs(self._document_editor.dom)
         refs = self._resulting_refs(old_ref, group_id, paragraphs, element_index)
         return EditResult(
             refs[0],
@@ -814,11 +841,15 @@ class Document:
         Cheap bounds check for pagination — avoids building the full
         :meth:`list_paragraphs` result just to learn the count.
 
+        Paragraphs inside a drawing's text box are not counted — text boxes
+        are excluded from the ref index space entirely, so no ref addresses
+        one (see :func:`~docx_editor.xml_editor.body_paragraphs`).
+
         Returns:
             Total number of paragraphs (the highest valid 1-based ref index).
         """
         self._ensure_open()
-        return len(self._document_editor.dom.getElementsByTagName("w:p"))
+        return len(body_paragraphs(self._document_editor.dom))
 
     def list_paragraphs(
         self, max_chars: int = 80, *, start: int = 1, limit: int | None = _DEFAULT_LIST_LIMIT
@@ -917,7 +948,7 @@ class Document:
                 raise ValueError(f"'limit' must be an integer or None, got {limit!r}")
             if limit < 0:
                 raise ValueError(f"limit must be >= 0, got {limit}")
-        paragraphs = self._document_editor.dom.getElementsByTagName("w:p")
+        paragraphs = body_paragraphs(self._document_editor.dom)
         begin = start - 1
         end = begin + limit if limit is not None else None
         return enumerate(paragraphs[begin:end], start=begin + 1)
@@ -1017,7 +1048,7 @@ class Document:
             print(info.ref, info.text)
         """
         self._ensure_open()
-        paragraphs = self._document_editor.dom.getElementsByTagName("w:p")
+        paragraphs = body_paragraphs(self._document_editor.dom)
         if index < 1 or index > len(paragraphs):
             raise ParagraphIndexError(index, len(paragraphs))
         style_outlines, _ = self._style_maps()
@@ -1095,7 +1126,7 @@ class Document:
                 paragraph content.
         """
         parsed = ParagraphRef.parse(ref)
-        paragraphs = self._document_editor.dom.getElementsByTagName("w:p")
+        paragraphs = body_paragraphs(self._document_editor.dom)
         if parsed.index < 1 or parsed.index > len(paragraphs):
             raise ParagraphIndexError(parsed.index, len(paragraphs))
         p = paragraphs[parsed.index - 1]
@@ -1272,7 +1303,7 @@ class Document:
         dom = self._document_editor.dom
         table_index = _build_table_index(dom)
         style_outlines, style_numbering = self._style_maps()
-        paragraphs = dom.getElementsByTagName("w:p")
+        paragraphs = body_paragraphs(dom)
         heading_paths = _compute_heading_paths(paragraphs, style_outlines)
         section_indexes = _compute_section_indexes(paragraphs)
         result = []
@@ -1295,13 +1326,19 @@ class Document:
         """Get the visible text of the document.
 
         Returns flattened text with paragraphs separated by newlines.
-        Inserted text is included, deleted text is excluded.
+        Inserted text is included, deleted text is excluded. Text inside a
+        drawing's text box is excluded too — it belongs to the box, not to
+        any addressable paragraph. A document whose content lives entirely in
+        text boxes therefore returns nothing but the separators between its
+        host paragraphs, so test it with ``.strip()``;
+        :attr:`has_textbox_content` tells that case from a genuinely empty
+        document.
 
         Returns:
             The visible text content
         """
         self._ensure_open()
-        paragraphs = self._document_editor.dom.getElementsByTagName("w:p")
+        paragraphs = body_paragraphs(self._document_editor.dom)
         parts = []
         for p in paragraphs:
             tm = build_text_map(p)
@@ -1317,6 +1354,8 @@ class Document:
 
         For intra-paragraph revisions this equals what get_visible_text()
         would return after reject_all(), without modifying the document.
+        Text inside a drawing's text box is excluded, exactly as in
+        get_visible_text().
         Read-only: paragraph references, hashes, and all editing operations
         keep working on the accepted (visible) view.
 
@@ -1324,7 +1363,7 @@ class Document:
             The original text content
         """
         self._ensure_open()
-        paragraphs = self._document_editor.dom.getElementsByTagName("w:p")
+        paragraphs = body_paragraphs(self._document_editor.dom)
         parts = []
         for p in paragraphs:
             tm = build_text_map(p, view="original")
@@ -1342,9 +1381,9 @@ class Document:
 
         A verification view for humans and agents (e.g. checking redlines
         without accepting them), not a parseable format: author names are
-        not escaped, tabs/breaks are not rendered, and text inside a
-        drawing's text box appears both inline in the host paragraph's line
-        and again as its own line (same as get_text()).
+        not escaped and tabs/breaks are not rendered. Text inside a
+        drawing's text box does not appear at all — box content is excluded
+        from every text view and from paragraph enumeration.
 
         Returns:
             The marked-up text content
@@ -1802,7 +1841,7 @@ class Document:
             (gid, op.note, _batch_note_reason(op)) for op, gid in zip(operations, group_ids, strict=True)
         ])
         any_split = any(gid is not None and mgr.split_count(gid) for gid in group_ids)
-        paragraphs = self._document_editor.dom.getElementsByTagName("w:p")
+        paragraphs = body_paragraphs(self._document_editor.dom)
         element_index = mgr._revision_element_index() if any_split else None
         return [
             self._edit_result(op.paragraph, gid, paragraphs, element_index, comment_id=cid)
@@ -1902,7 +1941,7 @@ class Document:
         # identity so a shifted later rewrite never reports a stale index.
         mgr = self._revision_manager
         any_split = any(gid is not None and mgr.split_count(gid) for gid in group_ids)
-        paragraphs = self._document_editor.dom.getElementsByTagName("w:p")
+        paragraphs = body_paragraphs(self._document_editor.dom)
         element_index = mgr._revision_element_index() if any_split else None
         return [
             self._edit_result(ref, group_id, paragraphs, element_index)
@@ -2075,9 +2114,12 @@ class Document:
             ``occurrence=`` parameter of replace()/delete()/add_comment();
             for deletions it counts in the original, pre-revision text and
             must not be passed to those APIs; None when the text is not
-            locatable, e.g. nested revisions), plus ``nested_under`` and
-            ``contains_ids`` describing revision nesting (e.g. a foreign
-            deletion inside another author's pending insertion), and
+            locatable, e.g. nested revisions, or when ``paragraph_ref`` is
+            itself None — a revision inside a drawing's text box lists and
+            accepts by id, but has no addressable location), plus
+            ``nested_under`` and ``contains_ids`` describing revision
+            nesting (e.g. a foreign deletion inside another author's
+            pending insertion), and
             ``group_id``/``group_source`` linking revisions from the same
             logical edit — recorded for this session's edits, inferred by
             parse-time reconstruction for revisions already in the file

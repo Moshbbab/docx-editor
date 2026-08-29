@@ -346,7 +346,7 @@ original = doc.get_original_text()
 # numbering resolved), heading context, and section index. Base conventions
 # are MIXED — read the comments:
 loc = doc.get_paragraph_location("P3#b2c4")
-if loc.table:  # table.index, row, col are all 1-based
+if loc.table:  # table.index, row, col are all 1-based (body tables only)
     print(f"table {loc.table.index} r{loc.table.row} c{loc.table.col}")
 if loc.list:  # ilvl is 0-based (0 == top level)
     print(f"list numId={loc.list.num_id} level={loc.list.ilvl}")
@@ -684,8 +684,8 @@ print(doc.get_markup_text())
 ```
 
 A human/agent verification view, not a parseable format (author names are not
-escaped; tabs/breaks are not rendered; text inside a drawing's text box
-appears both inline and again as its own line, same as `get_text()`).
+escaped; tabs/breaks are not rendered; text inside a drawing's text box does
+not appear at all, same as `get_visible_text()` — see Limitations).
 
 ### Reviewing Someone Else's Redlines
 
@@ -1274,7 +1274,7 @@ which is tested by round-tripping real documents. Text in shapes and text boxes 
 excluded rather than half-editable, and headers, footers, footnotes and endnotes
 wait for a real demand.
 
-- **Text in shapes/text boxes**: May not be accessible via standard paragraph iteration
+- **Text in shapes/text boxes**: Excluded, deliberately — text boxes are not an editing surface. Text-box content (`w:txbxContent`) appears in no paragraph listing, no text view, no search and no paragraph hash, and no ref addresses it. Word normally stores a box twice (an `mc:Choice` copy and an `mc:Fallback` copy), and a correct edit would have to write both copies, so an addressable box paragraph would let one write update a single copy and desynchronize the pair. The exclusion is uniform either way — a box stored once is excluded too. To read a box's text, go through HTML: `soffice --headless --convert-to html file.docx` then `pandoc file.html -t plain` (pandoc may render a `[ShapeN]` label beside a box's text, from the placeholder LibreOffice exports for a named shape — ignore those). Its `txt:Text` filter and pandoc reading the `.docx` directly both drop text boxes silently, so neither tells you anything is missing. A revision *inside* a box is still listed with `paragraph_ref`/`occurrence` left `None`, and `accept_all()`/`reject_all()` always resolve it. Anything narrower depends on the storage: a twice-stored box lists the revision once per copy, so one `accept_revision()`/`accept_group()` call resolves only one of them; copies with distinct ids and identical author/date share an inferred changeset that `accept_changeset()` resolves, while copies sharing a `w:id` are ungroupable (`group_id` and `changeset_id` both `None`), so no group- or changeset-keyed call reaches them and `accept_all()`/`reject_all()` is the single call that takes both. Because an all-text-box file (a poster, a flyer, a certificate) therefore reads as blank — `get_visible_text()` returns only the separators between its host paragraphs — check `doc.has_textbox_content` before reporting a document as having no text: `if not doc.get_visible_text().strip() and doc.has_textbox_content:`.
 - **Charts**: Text inside charts is embedded in separate XML, not easily editable
 - **Concurrent editing**: Not supported — a second open of the same document raises `WorkspaceLockedError`; use sequential access
 - **Most edits**: Are in paragraphs and tables, which are well supported
