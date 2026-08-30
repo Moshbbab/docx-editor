@@ -44,6 +44,11 @@ Ordered by value. Each is one board task and one PR unless noted.
 
 Plan: turn the module into a package `docx_editor/track_changes/` with one module per cluster; `RevisionManager` stays as the façade so the public API and `from docx_editor.track_changes import …` do not change. Rules: one cluster per PR, each PR a pure move (`git` must show renames, zero logic edits), gates unchanged — the test suite, the walk-count pins, and the corpus harness are the safety net that makes this mechanical. Do this **before** any further edit-site work (#6, #63c); it is what lets a fix land once instead of six times.
 
+Progress and decisions (2026-08-30):
+- **Step 1 merged** (PR #83): `track_changes.py` → package `track_changes/` with `models.py` (dataclasses, tag constants, validators), `dom.py` (minidom helpers), `diff.py` (tokenize/hunks/affix trimming), `manager.py` (`RevisionManager`, unchanged); `__init__.py` re-exports the public API. `scripts/check_pure_move.py --base main` is the gate for every step: line-multiset equality minus import plumbing, AST identity of every method, and `base.py` may hold only verbatim copies.
+- **Mixins and `ty`**: a method in one mixin that touches an attribute or method defined elsewhere fails `ty`'s `unresolved-attribute`. Decision: a typed `_RevisionManagerBase` in `base.py` declaring the instance attributes and one verbatim-copied stub per cross-cluster callee (`raise NotImplementedError`) — not a package-wide `[[tool.ty.overrides]]`, which would turn every `self.*` into `Unknown`.
+- **Remaining steps, one PR each, in order**: registry → locate → batch → replace → delete → insert (+ paragraph split/rejoin) → listing → resolution. Each moves its methods byte-identically into `<cluster>.py` as `class _<Cluster>Mixin(_RevisionManagerBase)` and adds the mixin to `RevisionManager`'s bases. Gate: pure-move script, ruff/format/ty, full suite (`-n 4`, 16 GB cap), CI; self-review only.
+
 ### 6. `w:br` in the paragraph text map  [second half of #6; `w:tab` shipped in 0.8.1]
 
 A run-level line break is still invisible to search, hashes and edit placement. It cannot map to `\n` (that means paragraph split — see commitments); candidate is a distinct atomic character (e.g. `\u2028`, LINE SEPARATOR) with the same boundary-only edit rules as tabs. Refs of affected paragraphs change, as they did for tabs.
