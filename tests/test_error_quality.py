@@ -985,7 +985,7 @@ class TestRewriteNewTextValidation:
     tokenizer, and ``batch_rewrite(None)`` silently returned ``[]`` (the
     falsy-input guard swallowed it) — indistinguishable from an empty batch.
 
-    After: new_text must be a str (empty allowed — it deletes all text) at
+    After: new_text must be a str (empty allowed — it deletes all text of a tab-free paragraph) at
     both the single and batch boundaries; the batch check runs in the
     upfront validation loop so atomicity holds; and batch inputs must be a
     real list.
@@ -1316,8 +1316,9 @@ def hello_doc(doc_path):
 
 
 class TestControlCharRejection:
-    """Tab, CR, and other C0/DEL controls are rejected at every text input;
-    only '\\n' passes (a tracked paragraph split). See ISSUES.md #58+61."""
+    """CR and the other C0/DEL controls are rejected at every text input. Two
+    exceptions: '\\n' in content (a tracked paragraph split) and '\\t' in
+    search/anchor text (a tab mark, ISSUES.md #6). See ISSUES.md #58+61."""
 
     def test_replace_rejects_tab_in_content(self, hello_doc):
         doc, ref = hello_doc
@@ -1355,8 +1356,10 @@ class TestControlCharRejection:
         assert doc.paragraph_count() == 2
 
     def test_rewrite_rejects_tab(self, hello_doc):
+        # A tab in new_text is only allowed where the paragraph already has one
+        # (ISSUES.md #6); this paragraph has none, so the tab-count check refuses it.
         doc, ref = hello_doc
-        with pytest.raises(ValueError, match="control character"):
+        with pytest.raises(ValueError, match="tab marks"):
             doc.rewrite_paragraph(ref, "new\ttext")
 
     def test_rewrite_allows_newline(self, hello_doc):

@@ -21,6 +21,7 @@ from .exceptions import (
     HashMismatchError,
     ParagraphIndexError,
     UnanchoredNoteWarning,
+    _truncate_preview,
 )
 from .track_changes import (
     EditOperation,
@@ -484,7 +485,8 @@ class Document:
         """Find text in the document, including across element boundaries.
 
         Args:
-            text: Text to search for (must be non-empty)
+            text: Text to search for (must be non-empty; a tab mark is
+                ``\\t``, as in ``get_visible_text()``)
             occurrence: Which occurrence (0 = first, 1 = second, etc.).
                 Counts document-wide when ``paragraph`` is None, and within
                 the paragraph when scoped — the same convention as the edit
@@ -1133,9 +1135,7 @@ class Document:
         actual_hash = compute_paragraph_hash(p)
         if actual_hash != parsed.hash:
             tm = build_text_map(p)
-            preview = tm.text[:80]
-            if len(tm.text) > 80:
-                preview += "..."
+            preview = _truncate_preview(tm.text)
             raise HashMismatchError(parsed.index, parsed.hash, actual_hash, preview)
         return parsed.index, paragraphs
 
@@ -1326,7 +1326,11 @@ class Document:
         """Get the visible text of the document.
 
         Returns flattened text with paragraphs separated by newlines.
-        Inserted text is included, deleted text is excluded. Text inside a
+        Inserted text is included, deleted text is excluded, and a tab mark
+        (``<w:tab/>``) is one ``\\t`` — the coordinate space ``find_text()``
+        searches and ``SearchResult`` offsets index. Text a tracked move took
+        away (``w:moveFrom``) is excluded like a deletion; its destination
+        (``w:moveTo``) is included. Text inside a
         drawing's text box is excluded too — it belongs to the box, not to
         any addressable paragraph. A document whose content lives entirely in
         text boxes therefore returns nothing but the separators between its
@@ -1381,7 +1385,8 @@ class Document:
 
         A verification view for humans and agents (e.g. checking redlines
         without accepting them), not a parseable format: author names are
-        not escaped and tabs/breaks are not rendered. Text inside a
+        not escaped and tabs/breaks are not rendered (unlike
+        ``get_visible_text()``, where a tab mark is a ``\\t``). Text inside a
         drawing's text box does not appear at all — box content is excluded
         from every text view and from paragraph enumeration.
 
@@ -1467,8 +1472,9 @@ class Document:
                 dropped and ``comment_id`` is None.
 
         Raises:
-            ValueError: If ``find`` is not a non-empty string,
-                ``replace_with`` is not a string, ``paragraph`` is missing or
+            ValueError: If ``find`` is not a non-empty string or contains a
+                tab (``\\t`` — a tab mark can be matched but not replaced yet,
+                ISSUES.md #6), ``replace_with`` is not a string, ``paragraph`` is missing or
                 not a ref string, ``occurrence`` is negative or not an integer,
                 ``note`` is neither None nor a non-empty control-character-free
                 string, or ``find`` is a SearchResult and
@@ -1538,10 +1544,12 @@ class Document:
                 is dropped and ``comment_id`` is None.
 
         Raises:
-            ValueError: If ``text`` is not a non-empty string, ``paragraph``
-                is missing or not a ref string, ``occurrence`` is negative or
-                not an integer, ``note`` is neither None nor a non-empty
-                control-character-free string, or ``text`` is a SearchResult
+            ValueError: If ``text`` is not a non-empty string or contains a
+                tab (``\\t`` — a tab mark can be matched but not deleted yet,
+                ISSUES.md #6), ``paragraph`` is missing or not a ref string,
+                ``occurrence`` is negative or not an integer, ``note`` is
+                neither None nor a non-empty control-character-free string,
+                or ``text`` is a SearchResult
                 and ``paragraph``/``occurrence`` was given too.
             TextNotFoundError: If ``text`` is absent or ``occurrence`` is out
                 of range for the paragraph.
@@ -1882,7 +1890,10 @@ class Document:
 
         Raises:
             ValueError: If ``new_text`` is not a string (empty string is
-                allowed — it deletes all text), ``note`` is neither None nor a
+                allowed — it deletes all text of a tab-free paragraph) or does
+                not hold the same number of tab marks (``\\t``) as the
+                paragraph (ISSUES.md #6),
+                ``note`` is neither None nor a
                 non-empty control-character-free string, or ``ref`` is
                 malformed.
             ParagraphIndexError: If ``ref``'s index is out of range.

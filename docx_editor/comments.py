@@ -17,6 +17,7 @@ from .exceptions import (
     HashMismatchError,
     ParagraphIndexError,
     TextNotFoundError,
+    _truncate_preview,
 )
 from .xml_editor import (
     DocxXMLEditor,
@@ -158,8 +159,10 @@ class CommentManager:
                 ``anchor_text`` matches more than once in the search scope.
             HashMismatchError: If a paragraph reference's hash is stale.
             ParagraphIndexError: If a paragraph reference's index is out of range.
-            CommentError: If ``anchor_text`` is not a non-empty string, or
-                ``comment_text`` is not a string.
+            CommentError: If ``anchor_text`` is not a non-empty string,
+                ``comment_text`` is not a string, or either holds a control
+                character (``anchor_text`` may contain ``\\t`` — a tab mark is
+                one text-map character — but ``comment_text`` may not).
             ValueError: If ``occurrence`` is negative or not an integer.
         """
         if not isinstance(anchor_text, str) or not anchor_text:
@@ -171,7 +174,7 @@ class CommentManager:
         # an invisible, unreviewable literal.
         self._validate_comment_text(comment_text, field="comment_text", ctx="add_comment(): ")
         try:
-            _reject_control_chars(anchor_text, field="anchor_text", ctx="add_comment(): ", allow_newline=False)
+            _reject_control_chars(anchor_text, field="anchor_text", ctx="add_comment(): ", allow_tab=True)
         except ValueError as e:
             raise CommentError(str(e)) from e
         _, match = self._locate_anchor(anchor_text, paragraph, occurrence)
@@ -294,9 +297,7 @@ class CommentManager:
             actual = compute_paragraph_hash(p)
             if actual != ref.hash:
                 tm = build_text_map(p)
-                preview = tm.text[:80]
-                if len(tm.text) > 80:
-                    preview += "..."
+                preview = _truncate_preview(tm.text)
                 raise HashMismatchError(ref.index, ref.hash, actual, preview)
             text_map = build_text_map(p)
             total = count_in_text_map(text_map, anchor_text)
@@ -427,7 +428,9 @@ class CommentManager:
         Iterates *direct* children of ``run`` (not descendants) so non-``w:t``
         content like ``<w:tab/>``, ``<w:br/>``, ``<w:drawing/>``, and field
         markers is preserved, and so ``w:t`` nodes nested inside a drawing's
-        text box are left untouched.
+        text box are left untouched. A ``<w:tab/>`` may itself be an edge: it
+        is one text-map character, so the marker simply lands before or after
+        the tab's own run.
         """
         rPr_xml = get_rPr_xml(run)
 
@@ -469,7 +472,17 @@ class CommentManager:
                     parts.append(f"<w:r>{rPr_xml}<w:t>{_escape_xml(after)}</w:t></w:r>")
             return parts
 
-        xml_parts = rebuild_run_fragments(run, rPr_xml, render_wt)
+        def render_other(child) -> list[str]:
+            # Range markers are run-level marks, so a <w:tab/> edge needs no
+            # split: the marker brackets the tab's own run.
+            parts = [f"<w:r>{rPr_xml}{child.toxml()}</w:r>"]
+            if start_marker and child is start_node:
+                parts.insert(0, start_marker)
+            if end_marker and child is end_node:
+                parts.append(end_marker)
+            return parts
+
+        xml_parts = rebuild_run_fragments(run, rPr_xml, render_wt, render_other)
         self.document_editor.replace_node(run, "".join(xml_parts))
 
     def reply_to_comment(self, parent_comment_id: int, reply_text: str) -> int:

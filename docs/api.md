@@ -270,7 +270,7 @@ for ref, loc in doc.list_paragraph_locations():
 
 #### `get_visible_text()`
 
-Get flattened visible document text. Inserted text is included and deleted text is excluded. Text inside a drawing's text box is excluded too — it belongs to the box, not to any addressable paragraph. A document whose content lives entirely in text boxes therefore returns nothing but the separators between its host paragraphs; check [`has_textbox_content`](#has_textbox_content) before reporting it as empty.
+Get flattened visible document text. Inserted text is included and deleted text is excluded. A tab mark (`<w:tab/>`) renders as one `\t` character — the same coordinate space `find_text()` searches and `SearchResult.start`/`end` index. Text a tracked move took away (`w:moveFrom`) is excluded like a deletion; its destination (`w:moveTo`) is included. Text inside a drawing's text box is excluded too — it belongs to the box, not to any addressable paragraph. A document whose content lives entirely in text boxes therefore returns nothing but the separators between its host paragraphs; check [`has_textbox_content`](#has_textbox_content) before reporting it as empty.
 
 **Returns:** Visible text with paragraphs separated by newlines (str)
 
@@ -294,11 +294,11 @@ text = doc.get_original_text()
 
 #### `find_text(text, occurrence=0, paragraph=None)`
 
-Find text in the document, including text spanning XML element boundaries. Text-box content is excluded, as it is from [`paragraph_count()`](#paragraph_count).
+Find text in the document, including text spanning XML element boundaries. Text-box content is excluded, as it is from [`paragraph_count()`](#paragraph_count). A tab mark is `\t` in the searchable text: `"Name\tValue"` matches `Name<tab>Value`, while `"NameValue"` does not (the `TextNotFoundError` message and its `paragraph_preview` spell the tab as the two characters `\t`, so it cannot be mistaken for a space).
 
 **Parameters:**
 
-- `text` (str): Text to search for (must be non-empty)
+- `text` (str): Text to search for (must be non-empty; may contain `\t` to match a tab mark)
 - `occurrence` (int): Which occurrence to return, 0-based (0 = first). Counted document-wide when `paragraph` is None, and within the paragraph when scoped. Defaults to 0.
 - `paragraph` (str, optional): Paragraph reference (e.g. `P2#f3c1`) to scope the search — the same scoping `find_all` offers. `None` searches the whole document. Defaults to None.
 
@@ -353,7 +353,7 @@ themselves, e.g. `"aa"` in `"aaaa"`.)
 
 #### `count_matches(text)`
 
-Count visible text matches across the document. Text-box content is excluded, as it is from [`paragraph_count()`](#paragraph_count).
+Count visible text matches across the document. Text-box content is excluded, as it is from [`paragraph_count()`](#paragraph_count). Tab marks are `\t` in the searched text, as in `find_text()`.
 
 **Parameters:**
 
@@ -378,7 +378,7 @@ A replace landing wholly inside **your own** pending insertion **amends** that i
 
 **Parameters:**
 
-- `find` (str | [`SearchResult`](#searchresult)): Text to find and replace, or a match from `find_text()`/`find_all()` — which also supplies `paragraph` and `occurrence` (pass neither with it)
+- `find` (str | [`SearchResult`](#searchresult)): Text to find and replace, or a match from `find_text()`/`find_all()` — which also supplies `paragraph` and `occurrence` (pass neither with it). Must not contain `\t`: a tab mark can be matched but not replaced yet — target the text beside it (`ValueError`, ISSUES.md #6)
 - `replace_with` (str): Replacement text
 - `paragraph` (str): Paragraph reference from `list_paragraphs()`, such as `P2#f3c1`. Required unless `find` is a `SearchResult`.
 - `occurrence` (int | None): Which occurrence within the paragraph, 0-based (0 = first). Omitted → the target must be unique within the paragraph; if it matches more than once, [`AmbiguousTextError`](#ambiguoustexterror) is raised instead of silently editing the first match.
@@ -403,7 +403,7 @@ Mark text as deleted with tracked changes. Deleting text inside another author's
 
 **Parameters:**
 
-- `text` (str | [`SearchResult`](#searchresult)): Text to mark as deleted, or a match from `find_text()`/`find_all()` — which also supplies `paragraph` and `occurrence` (pass neither with it)
+- `text` (str | [`SearchResult`](#searchresult)): Text to mark as deleted, or a match from `find_text()`/`find_all()` — which also supplies `paragraph` and `occurrence` (pass neither with it). Must not contain `\t`: a tab mark can be matched but not deleted yet — target the text beside it (`ValueError`, ISSUES.md #6)
 - `paragraph` (str): Paragraph reference from `list_paragraphs()`, such as `P2#f3c1`. Required unless `text` is a `SearchResult`.
 - `occurrence` (int | None): Which occurrence within the paragraph, 0-based (0 = first). Omitted → the target must be unique within the paragraph; if it matches more than once, [`AmbiguousTextError`](#ambiguoustexterror) is raised instead of silently editing the first match.
 - `note` (str | None): Rationale for this edit, anchored as a comment on the revisions it creates — see [Rationale notes](#rationale-notes)
@@ -475,8 +475,21 @@ if match := doc.find_text("Section 6"):
 > `new_text`, or a `batch_edit` op) is a **tracked paragraph split**: the first
 > paragraph's mark is flagged inserted and the tail moves into a new paragraph.
 > Accepting keeps the split; rejecting rejoins. All other C0 control characters
-> (`\t`, `\r`, …) are rejected with a teaching `ValueError`. See
+> (`\r`, NUL, …) are rejected with a teaching `ValueError`. See
 > [`split_paragraph`](#split_paragraphref-before-occurrencenone) and [`EditResult`](#editresult).
+
+> **Tabs are searchable, not writable.** A `<w:tab/>` mark is one `\t`
+> character in the visible and original text views — hence in search, offsets
+> and hashes; `get_markup_text()` does not render it — so search and anchor
+> text may contain `\t`:
+> `insert_after("Name\t", "x")` lands right after the tab, and a `\n` split
+> may fall on either side of one. Content text (`replace_with`, insert `text`,
+> `note`, comment bodies) still rejects `\t` — nothing writes a tracked tab —
+> and a `replace`/`delete` target that contains `\t` is rejected with a
+> `ValueError`: a tab can be matched but not removed yet (ISSUES.md #6).
+> Because tabs take part in paragraph hashes, refs of tab-bearing paragraphs
+> differ from those computed before tabs were mapped (refs are session-scoped
+> anyway).
 
 #### Rationale notes
 
@@ -623,7 +636,7 @@ resolve them as a unit with [`accept_group()`](#accept_groupgroup_id) /
 **Parameters:**
 
 - `ref` (str): Paragraph reference from `list_paragraphs()`
-- `new_text` (str): Desired paragraph text
+- `new_text` (str): Desired paragraph text. Must hold the same number of `\t` as the paragraph has tab marks: the text between consecutive tabs is rewritten segment by segment, so `rewrite_paragraph(ref, info.text.replace(...))` works on tab-bearing paragraphs and words may move across a tab, while a rewrite that adds or removes a tab raises `ValueError` (ISSUES.md #6)
 - `note` (str | None): Rationale for the rewrite, anchored as one comment spanning its first through last revision — see [Rationale notes](#rationale-notes)
 
 **Returns:** Updated paragraph reference ([`EditResult`](#editresult) — a `str` subclass also carrying the edit's `group_id`/`changeset_id`/`revision_ids`; `group_id` is `None` when `new_text` equals the current text, or when every change landed inside your own pending insertions and amended them in place — undo those by rejecting the group of the amended insertion; `comment_id` carries a `note=`'s comment)
@@ -712,7 +725,7 @@ smart-quote splits, `w:ins` wrappers) are found. Text-box content is excluded, a
 
 **Parameters:**
 
-- `anchor_text` (str | [`SearchResult`](#searchresult)): Text to attach the comment to, or a match from `find_text()`/`find_all()` — which also supplies `paragraph` and `occurrence` (pass neither with it)
+- `anchor_text` (str | [`SearchResult`](#searchresult)): Text to attach the comment to, or a match from `find_text()`/`find_all()` — which also supplies `paragraph` and `occurrence` (pass neither with it). May contain `\t` (a tab mark) anywhere, including at either end — the comment range brackets the tab
 - `comment` (str): The comment content
 - `paragraph` (str, optional): Paragraph reference (e.g. `P3#a7b2`) to scope the search. `None` searches the whole document. Defaults to None.
 - `occurrence` (int | None): Which occurrence to anchor to, 0-based (0 = first), counted within `paragraph` when given and document-wide otherwise. Omitted → the anchor must be unique in the search scope, else [`AmbiguousTextError`](#ambiguoustexterror).
@@ -1517,7 +1530,8 @@ from docx_editor import SearchResult
 | `paragraph_index` | int | 1-based index of the containing paragraph — the same integer embedded in `paragraph_ref`, so you never string-parse the ref |
 
 `start`/`end` are offsets within the matched paragraph's visible text, **not**
-document-wide offsets. Coordinate systems differ between search and edit:
+document-wide offsets; a tab mark counts as one character (`\t`), exactly as
+in `get_visible_text()`. Coordinate systems differ between search and edit:
 `find_text`'s `occurrence` counts matches document-wide (unless scoped with
 `paragraph=`), while edit methods count within one paragraph —
 `paragraph_occurrence` bridges the two, so always pass it alongside
@@ -1643,7 +1657,8 @@ Raised when the specified text is not found in the document, or when an
 explicit `occurrence` is out of range — the error then carries `occurrence`
 and `total_occurrences` and its message reports the actual count instead of
 claiming the text is absent. Other structured fields: `search_text`,
-`paragraph_ref`, `paragraph_preview`.
+`paragraph_ref`, `paragraph_preview` (a tab mark is spelled `\t` in every
+preview, so it cannot pass for a space).
 
 ```python
 from docx_editor.exceptions import TextNotFoundError
@@ -1679,7 +1694,7 @@ Raised when a `paragraph` ref's hash no longer matches the paragraph's current
 content — the paragraph changed (usually by an earlier edit) since the ref was
 listed, so the ref is stale. Structured fields: `paragraph_index` (1-based),
 `expected_hash` (the hash in the stale ref), `actual_hash` (the paragraph's
-current hash), and `paragraph_preview` (the current text). Recover by retrying
+current hash), and `paragraph_preview` (the current text, a tab mark spelled `\t`). Recover by retrying
 with the fresh ref `P{paragraph_index}#{actual_hash}`, or re-list paragraphs.
 
 ```python
