@@ -59,7 +59,31 @@ Only `w:instrText` is known to the library today. A `replace()` targeting text i
 
 ### 72. Timing-sensitive session tests are flaky on CI
 
-Two `tests/test_session.py` tests failed on single CI jobs in one night and passed on rerun, on commits that did not touch `session.py`: `test_main_full_lifecycle` (`main(["start", …])` returned 1 on Python 3.12, run 33277764141) and `test_stop_session_is_prompt` (`stop_session` took 5.02 s against a `< 3.0 s` assertion on Python 3.14, run 33298581269 — 5 s is exactly the `_kernel_alive` probe timeout, so the shutdown ack was missed under load). Every flake costs a 20–30 min rerun. Fix the tests' dependence on wall-clock under xdist load (a start budget that scales, a stop assertion on *behaviour* — ack received — not on seconds), and make a failed `start` print *why*.
+Two `tests/test_session.py` tests failed on single CI jobs in one night and passed on rerun, on commits that did not touch `session.py`: `test_main_full_lifecycle` (`main(["start", …])` returned 1 on Python 3.12, run 33277764141) and `test_stop_session_is_prompt` (`stop_session` took 5.02 s against a `< 3.0 s` assertion on Python 3.14, run 33298581269 — 5 s is exactly the `_kernel_alive` probe timeout, so the shutdown ack was missed under load). Every flake costs a 20–30 min rerun. Same family: `tests/test_session.py:138` waits with `time.sleep(1.0)` instead of an `execute_input` handshake. Fix the tests' dependence on wall-clock under xdist load (a start budget that scales, a stop assertion on *behaviour* — ack received — not on seconds), and make a failed `start` print *why*.
+
+### 75. Author-filtered bulk resolution must not touch other authors' revisions  [data loss; after #73 step 9]
+
+`accept_all(author=A)` / `reject_all(author=A)` list revisions by author but resolve by `w:id`, and the id lookup has no author check. With B's `<w:ins w:id="7">` before A's `<w:del w:id="7">` (duplicate ids across authors occur in real files — the corpus has them from LibreOffice), `reject_all(author="A")` deletes B's inserted text and `accept_all(author="A")` makes it permanent, both reporting 2. The `accept_all` docstring documents this and `tests/test_track_changes.py::…:1143` pins it as expected — it is not acceptable for a data-loss path. Fix: resolve the exact elements selected by the listing (element identity), not their ids; flip the pinning test. Lives in the resolution cluster, so it lands after #73 moves it (found by CodeRabbit on PR #75; verified 2026-08-30).
+
+### 76. Comment reply reference run lands inside its own range
+
+`comments.py` `reply_to_comment` (and `move_comment_markers`) anchor two `insert_after` calls on the same node, so the second lands ahead of the first: `Start0, Start1, End0, Ref0, Ref1, End1`. Every other path uses `_comment_range_end_xml`, which emits end-then-reference. One-line fix plus a test that pins marker order (CodeRabbit, PR #79).
+
+### 77. unpack: a symlinked ancestor of `output_dir` bypasses the symlink refusal
+
+`unpack.py` checks only the leaf; `output_dir = <symlink>/out` with a non-existent leaf passes both guards and `mkdir(parents=True)` creates through the link, so `extractall` writes the document tree elsewhere. Check `(output_path, *output_path.parents)`; add the test shape (CodeRabbit, PR #20).
+
+### 78. `start_session` leaks the kernel when `kernel.json` is unreadable
+
+`session.py`: `_client(connection_file)` sits outside the cleanup guard and the startup loop only waits for `size > 0`, so a mid-write file reaches `load_connection_file()` → raw `ValueError`, the detached kernel keeps running and the `.pid`/connection files stay on disk. Move the call inside the `try` so the caller gets `SessionError` and the kernel is stopped (CodeRabbit, PR #61).
+
+### 79. Inserted text loses formatting after an empty split segment  [after #73 step 7]
+
+`_apply_paragraph_splits` resets `fallback_rPr = ""` whenever the current paragraph has no runs; a split at a paragraph end yields an empty tail, so the *next* segment drops the surrounding `rPr`: on a bold paragraph `insert_after(…, "A\nC")` keeps bold on `C`, `"A\n\nC"` loses it. The comment above the loop already claims the propagation works — PR #72 merged the comment but not the one-line fix. No test covers it. Lives in the insert/split cluster, so it lands after #73 moves it.
+
+### 80. Docs and spec drift found by the CodeRabbit audit
+
+README lists `batch_edit` among the methods taking `note=` (it does not); `docs/api.md` omits `w:numberingChange` from the unhandled-type list; `ResolveResult.unhandled` is described as document-wide but is author-scoped by design (the prose is wrong, not the code); `openspec/changes/` holds three implemented-but-unarchived proposals (`add-batch-edit`, `add-paragraph-hash-anchors`, `add-rewrite-paragraph`) whose text is stale; `Makefile` `test` has no `ulimit -v` fallback for hosts without a systemd user session.
 
 ### 69. Return-leg reconciliation: which changesets survived?  [design]
 
@@ -83,7 +107,7 @@ The product loop is agent proposes → human adjudicates in Word → document co
 
 ## How this roadmap is set
 
-Batches come from evidence, not ideas: four dogfooding rounds (consumer-persona agents driving the library from `SKILL.md` alone, adversarial error QA, token economics, scale), the corpus revision census (which types real producers emit), and a clean-room comparison against KitchenSink4Word (test *names* only — its code is PolyForm-NC and unusable). A finding becomes an item here, an item becomes a PR citing it, and a release closes a theme.
+CodeRabbit reviews every PR; its inline Critical/Major/Potential-issue comments are triaged before merge (an audit on 2026-08-30 of 261 unread comments produced #75–#80). Batches come from evidence, not ideas: four dogfooding rounds (consumer-persona agents driving the library from `SKILL.md` alone, adversarial error QA, token economics, scale), the corpus revision census (which types real producers emit), and a clean-room comparison against KitchenSink4Word (test *names* only — its code is PolyForm-NC and unusable). A finding becomes an item here, an item becomes a PR citing it, and a release closes a theme.
 
 ## Shipped
 
