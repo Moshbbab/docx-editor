@@ -1029,9 +1029,12 @@ def build_text_map(paragraph, view: Literal["accepted", "original"] = "accepted"
 
     - ``"accepted"`` (default): the visible text — text inside <w:ins> is
       included (with is_inside_ins=True), text inside <w:del>/<w:delText>
-      and <w:moveFrom> is excluded (a move's source reads as gone, its
-      <w:moveTo> destination as present). Paragraph hashes and all editing
-      operations use this view.
+      and <w:moveFrom> is excluded (a move's source reads as gone — Word
+      writes the moved-away text as plain <w:t> inside <w:moveFrom> — and its
+      <w:moveTo> destination as present, as plain text with
+      is_inside_ins=False: it is another author's pending move, not this
+      session's insertion). Paragraph hashes and all editing operations use
+      this view.
     - ``"original"``: the pre-revision text — <w:ins> and <w:moveTo> subtrees
       are excluded, <w:delText> is included, and text inside <w:del> or
       <w:moveFrom> is flagged with is_inside_del=True.
@@ -1066,8 +1069,8 @@ def build_text_map(paragraph, view: Literal["accepted", "original"] = "accepted"
                 continue
 
             # Skip w:del (deleted text uses w:delText, but be safe) and
-            # w:moveFrom: its text is w:delText too, but a moved-away tab
-            # mark would otherwise leak into the visible view.
+            # w:moveFrom: Word writes the moved-away text as plain w:t, and a
+            # moved-away tab mark would otherwise leak into the visible view.
             if _is_inside_element(node, "w:del") or _is_inside_element(node, "w:moveFrom"):
                 continue
 
@@ -1496,6 +1499,11 @@ class DocxXMLEditor(XMLEditor):
         # deliberately does not re-seed: the mark must stay monotonic across
         # a rolled-back batch too.
         self._max_change_id = -1
+        # True while the document holds a move range mark (set by the same
+        # walk that seeds the id counter, cleared by the range-mark sweep once
+        # none remain): lets RevisionManager skip the sweep — a full-document
+        # walk — on the overwhelmingly common move-free document.
+        self.holds_move_range_marks = False
         self._seed_max_change_id()
         self._tracked_change_collector: list[Element] | None = None
         self._frozen_timestamp: str | None = None
@@ -1524,32 +1532,61 @@ class DocxXMLEditor(XMLEditor):
         """
         nodes = super()._parse_fragment(xml_content)
         for node in nodes:
-            if node.nodeType != node.ELEMENT_NODE:
-                continue
-            if node.tagName in ("w:ins", "w:del"):
-                self._fold_change_id(node.getAttribute("w:id"))
-            for tag in ("w:ins", "w:del"):
-                for elem in node.getElementsByTagName(tag):
-                    self._fold_change_id(elem.getAttribute("w:id"))
+            self._fold_revision_ids(node)
         return nodes
 
+    def _fold_revision_ids(self, node) -> None:
+        """Fold the w:id of ``node`` (if it is a revision mark) and of every
+        revision mark under it.
+
+        Every tag in ``ALL_REVISION_TAGS``, not just ``w:ins``/``w:del``: Word
+        draws every revision mark's id from one counter, and list_revisions /
+        accept_revision address moves and paragraph-property changes by that
+        id too. An allocation that reused a pending ``w:moveFrom``'s id would
+        make our own edit and the foreign move indistinguishable by id — the
+        group undoing our edit would resolve their move instead.
+        """
+        # Imported here: track_changes imports this module at load time.
+        from .track_changes import ALL_REVISION_TAGS, MOVE_RANGE_TAGS, iter_revision_elements
+
+        def fold(elem) -> None:
+            self._fold_change_id(elem.getAttribute("w:id"))
+            if elem.tagName in MOVE_RANGE_TAGS:
+                self.holds_move_range_marks = True
+
+        if node.nodeType == node.ELEMENT_NODE and node.tagName in ALL_REVISION_TAGS:
+            fold(node)
+        for elem in iter_revision_elements(node, ALL_REVISION_TAGS):
+            fold(elem)
+
     def _seed_max_change_id(self) -> None:
-        """Fold every <w:ins>/<w:del> w:id already in the document into the mark.
+        """Fold every revision mark's w:id already in the document into the mark.
 
         Called once, eagerly, from __init__, so the full-DOM walk happens at
-        parse time rather than on the first change-id allocation. Reuses
-        _fold_change_id for the per-id logic (non-numeric and empty ids are
-        ignored there).
+        parse time rather than on the first change-id allocation. One
+        recursive walk over ``ALL_REVISION_TAGS`` (see ``_fold_revision_ids``);
+        non-numeric and empty ids are ignored by ``_fold_change_id``.
 
         The cost lands on every editor, including read-only workflows that
         never allocate an id, and including the small side-part editors
         ([Content_Types].xml, rels, settings, people.xml) which can never hold
-        revisions. Measured at ~39 ms on a 3000-paragraph document (~3% of
-        Document.open), which is the trade for taking it off the first edit.
+        revisions. The former two-tag scan measured ~39 ms on a
+        3000-paragraph document (~3% of Document.open) and the single walk is
+        cheaper still, which is the trade for taking it off the first edit.
         """
-        for tag in ("w:ins", "w:del"):
-            for elem in self.dom.getElementsByTagName(tag):
-                self._fold_change_id(elem.getAttribute("w:id"))
+        self._fold_revision_ids(self.dom)
+
+    def _reload_dom_from_bytes(self, xml_bytes: bytes) -> None:
+        """Restore a snapshot and recompute ``holds_move_range_marks`` for it.
+
+        The id counter is deliberately not re-seeded (see __init__), but the
+        flag describes the DOM's current content, so it follows the DOM: one
+        walk, on the rare rollback path only.
+        """
+        super()._reload_dom_from_bytes(xml_bytes)
+        from .track_changes import MOVE_RANGE_TAGS, iter_revision_elements
+
+        self.holds_move_range_marks = next(iter_revision_elements(self.dom, MOVE_RANGE_TAGS), None) is not None
 
     def _get_next_change_id(self) -> int:
         """Get the next available change ID.

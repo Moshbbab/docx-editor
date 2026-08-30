@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from conftest import count_dom_walks, find_ref
+from conftest import count_dom_walks, count_revision_walks, find_ref
 
 from docx_editor import Document, EditOperation, EditResult, RevisionError
 from docx_editor.exceptions import BatchOperationError, DocxEditError
@@ -550,11 +550,13 @@ class TestSplitReconstruction:
         texts = [t.firstChild.data for t in manager.editor.dom.getElementsByTagName("w:t") if t.firstChild]
         assert "C" in texts
 
-    def test_split_formatted_paragraph_copies_and_cleans_pPr(self, temp_xml):
+    @pytest.mark.parametrize("mark_tag", ["w:del", "w:moveFrom", "w:moveTo"])
+    def test_split_formatted_paragraph_copies_and_cleans_pPr(self, temp_xml, mark_tag):
         # Splitting a paragraph with rich properties: the tail copies pStyle +
-        # rPr formatting but drops the tracked pPrChange and the mark revision;
-        # the original keeps its pPr and takes the inserted split mark.
-        del_mark = '<w:del w:id="7" w:author="X" w:date="2024-01-01T00:00:00Z"/>'
+        # rPr formatting but drops the tracked pPrChange and the mark revision
+        # (a deleted or moved paragraph mark alike — copying it would duplicate
+        # its id); the original keeps its pPr and takes the inserted split mark.
+        del_mark = f'<{mark_tag} w:id="7" w:author="X" w:date="2024-01-01T00:00:00Z"/>'
         ppr_change = '<w:pPrChange w:id="8" w:author="X" w:date="2024-01-01T00:00:00Z"><w:pPr/></w:pPrChange>'
         body = (
             f'<w:p><w:pPr><w:pStyle w:val="Heading1"/><w:rPr><w:b/>{del_mark}</w:rPr>{ppr_change}</w:pPr>'
@@ -571,7 +573,7 @@ class TestSplitReconstruction:
         assert not tail_pPr.getElementsByTagName("w:pPrChange")  # tracked change dropped
         tail_rPr = tail_pPr.getElementsByTagName("w:rPr")
         assert tail_rPr and tail_rPr[0].getElementsByTagName("w:b")  # rPr formatting copied
-        assert not tail_rPr[0].getElementsByTagName("w:del")  # mark dropped from the copy
+        assert not tail_rPr[0].getElementsByTagName(mark_tag)  # mark dropped from the copy
 
     def test_split_paragraph_pStyle_without_rPr(self, temp_xml):
         # pPr present but no rPr: the mark check finds no ins mark, and flagging
@@ -1611,9 +1613,14 @@ class TestAcceptPathIndex:
             assert len(doc.list_revisions()) == 6
 
             walks = count_dom_walks(monkeypatch)
+            recursive = count_revision_walks(monkeypatch)
             assert getattr(doc, method)(changeset_id) == 6
-            # One index build, not one scan per member per pass.
-            assert walks == ["w:ins", "w:del"]
+            # No per-tag getElementsByTagName, and exactly one recursive
+            # document walk — the index build (a move-free document never
+            # pays for the range-mark sweep) — not one scan per member per
+            # pass.
+            assert walks == []
+            assert len(recursive) == 1
             assert doc.list_revisions() == []
 
     @pytest.mark.parametrize("method", ["accept_group", "reject_group"])
@@ -1623,8 +1630,10 @@ class TestAcceptPathIndex:
             result = doc.replace("quick", "speedy", paragraph=ref)  # one group, two revs
 
             walks = count_dom_walks(monkeypatch)
+            recursive = count_revision_walks(monkeypatch)
             assert getattr(doc, method)(result.group_id) == 2
-            assert walks == ["w:ins", "w:del"]
+            assert walks == []
+            assert len(recursive) == 1  # the index build; no sweep without range marks
             assert doc.list_revisions() == []
 
     @pytest.mark.parametrize("method", ["accept_all", "reject_all"])
@@ -1635,11 +1644,13 @@ class TestAcceptPathIndex:
         element index through every revision in a pass, so the full-DOM walk
         count is a small constant rather than growing with the redline size.
 
-        The ISSUES.md #64 honesty floor adds exactly one *recursive* traversal
-        per call (``iter_revision_elements`` over all ~30 revision tags), which
-        count_dom_walks cannot see because it hooks getElementsByTagName. That
-        is the point of the recursive form: the naive per-tag census would have
-        cost ~28 more getElementsByTagName walks and broken this pin.
+        The index build, the per-pass listing, the ISSUES.md #64 honesty-floor
+        census and the ISSUES.md #68 range-mark sweep are all *recursive*
+        traversals (``iter_revision_elements``), which count_dom_walks cannot
+        see because it hooks getElementsByTagName — the naive per-tag form
+        would have cost ~28 more getElementsByTagName walks. So both counters
+        are pinned: no getElementsByTagName at all, and a recursive walk count
+        that is the same small constant whatever the redline size.
         """
         counts = {}
         for label, words in (("small", ["quick"]), ("large", ["quick", "brown", "lazy"])):
@@ -1648,15 +1659,20 @@ class TestAcceptPathIndex:
                 doc.batch_edit([EditOperation.replace(w, w.upper(), paragraph=ref) for w in words])
                 n_revs = len(doc.list_revisions())
                 walks = count_dom_walks(monkeypatch)
+                recursive = count_revision_walks(monkeypatch)
                 assert getattr(doc, method)() == n_revs
-                counts[label] = (len(walks), n_revs)
+                counts[label] = (len(walks), len(recursive), n_revs)
                 monkeypatch.undo()
                 assert doc.list_revisions() == []
 
         # The larger redline really is larger, but costs the same walks.
-        assert counts["large"][1] > counts["small"][1]
-        assert counts["small"][0] == counts["large"][0]
-        assert counts["small"][0] <= 8
+        assert counts["large"][2] > counts["small"][2]
+        assert counts["small"][0] == counts["large"][0] == 0
+        assert counts["small"][1] == counts["large"][1]
+        # Index build, two listing passes (the second finds nothing) and the
+        # honesty-floor census; the range-mark sweep is skipped on a document
+        # that holds no range marks.
+        assert counts["small"][1] == 4
 
     def test_reject_group_with_nested_member_counts_once(self, temp_xml):
         # Rejecting the host insertion removes its whole subtree; the nested

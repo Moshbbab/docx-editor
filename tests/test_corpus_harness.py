@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 from conftest import replace_docx_parts
 
-from docx_editor import Document
+from docx_editor import Document, UnhandledRevisionWarning
 
 REPO = Path(__file__).resolve().parents[1]
 HARNESS_PATH = REPO / "benchmarks" / "corpus" / "corpus_harness.py"
@@ -86,6 +86,78 @@ def fake_soffice(tmp_path: Path, monkeypatch) -> Path:
     monkeypatch.setenv("FAKE_SOFFICE_HEARTBEAT", str(tmp_path / "heartbeat"))
     monkeypatch.setattr(harness, "LO_PROFILE", tmp_path / "lo profile")  # the space is the point
     return script
+
+
+IDLESS_MOVE_BODY = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
+    "<w:p><w:r><w:t>Hello world</w:t></w:r></w:p>"
+    '<w:p><w:moveFrom w:author="Ann" w:date="2026-01-29T16:55:00Z"><w:r><w:t>gone</w:t></w:r></w:moveFrom></w:p>'
+    "</w:body></w:document>"
+)
+
+
+def test_run_single_save2_accepts_what_accept_all_reported_as_unhandled(tmp_path: Path, monkeypatch):
+    """A w:moveFrom with no w:id cannot be reached by id; accept_all reports
+    it as unhandled, so its survival is not a save2 failure."""
+    monkeypatch.setattr(harness, "OUT_DIR", tmp_path / "out")
+    monkeypatch.setattr(harness, "WORK_DIR", tmp_path / "work")
+    src = tmp_path / "idless_move.docx"
+    replace_docx_parts(SIMPLE, src, {"word/document.xml": IDLESS_MOVE_BODY})
+
+    with pytest.warns(UnhandledRevisionWarning):  # the reopen stage's accept_all reports it
+        result = harness.run_single(src, do_soffice=False)
+
+    assert result["stages"]["reopen"]["unhandled"] == {"w:moveFrom": 1}
+    assert result["stages"]["save2"]["status"] == "pass"
+    assert result["stages"]["save2"]["census"] == {"w:moveFrom": 1}
+
+
+def test_run_single_save2_lets_range_marks_wait_for_a_reported_move(tmp_path: Path, monkeypatch):
+    """Range marks are swept with their move; while the move itself is
+    reported as unhandled (here: no w:id), its marks may stay too."""
+    monkeypatch.setattr(harness, "OUT_DIR", tmp_path / "out")
+    monkeypatch.setattr(harness, "WORK_DIR", tmp_path / "work")
+    body = IDLESS_MOVE_BODY.replace(
+        '<w:p><w:moveFrom w:author="Ann"',
+        '<w:p><w:moveFromRangeStart w:id="10" w:author="Ann" w:date="2026-01-29T16:55:00Z" w:name="m"/>'
+        '<w:moveFrom w:author="Ann"',
+    ).replace("</w:moveFrom></w:p>", '</w:moveFrom><w:moveFromRangeEnd w:id="10"/></w:p>')
+    src = tmp_path / "idless_move_with_marks.docx"
+    replace_docx_parts(SIMPLE, src, {"word/document.xml": body})
+
+    with pytest.warns(UnhandledRevisionWarning):
+        result = harness.run_single(src, do_soffice=False)
+
+    assert result["stages"]["save2"]["status"] == "pass"
+    assert result["stages"]["save2"]["census"] == {"w:moveFromRangeStart": 1, "w:moveFrom": 1, "w:moveFromRangeEnd": 1}
+
+
+def test_run_single_fails_save2_when_a_resolvable_element_survives_unreported(tmp_path: Path, monkeypatch):
+    """The save2 post-condition proper: an element accept_all neither resolved
+    nor reported. Simulated by a census that finds a w:ins accept_all's own
+    report does not account for."""
+    monkeypatch.setattr(harness, "OUT_DIR", tmp_path / "out")
+    monkeypatch.setattr(harness, "WORK_DIR", tmp_path / "work")
+    real_census = harness.census_file
+
+    def census_with_a_phantom_ins(path: Path) -> dict:
+        census = real_census(path)
+        if path.name.endswith("_final.docx"):
+            part = census["parts"].setdefault("word/document.xml", {"by_tag": {}, "ins_del_contexts": {}})
+            part["by_tag"]["w:ins"] = part["by_tag"].get("w:ins", 0) + 1
+        return census
+
+    monkeypatch.setattr(harness, "census_file", census_with_a_phantom_ins)
+    src = tmp_path / "plain.docx"
+    shutil.copy(SIMPLE, src)
+
+    result = harness.run_single(src, do_soffice=False)
+
+    save2 = result["stages"]["save2"]
+    assert save2["status"] == "fail"
+    assert save2["error_type"] == "AssertResolvedTypesRemain"
+    assert "'w:ins': 1" in save2["error"]
 
 
 @pytest.fixture
