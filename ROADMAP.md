@@ -52,9 +52,9 @@ A run-level line break is still invisible to search, hashes and edit placement. 
 
 Only `w:instrText` is known to the library today. A `replace()` targeting text inside a TOC entry, `REF` or page-number field applies, and Word silently discards it on the next field update — the same silent-loss family already eliminated elsewhere. Minimum: detect that a match falls inside `fldSimple`/`fldChar` run ranges and refuse with a teaching error; better: a read-side field inventory. Board task `f812f113` exists in the backlog.
 
-### 72. Flaky on CI: `tests/test_session.py::test_main_full_lifecycle`
+### 72. Timing-sensitive session tests are flaky on CI
 
-`main(["start", …])` returned 1 on one Python 3.12 job (run 33277764141, xdist worker); passed on every other version and on rerun; the PR did not touch `session.py`. Suspect: kernel start-up readiness (`_kernel_alive`, 5 s probe) under CI load. Reproduce under load or raise the start budget, and make a failed `start` print *why*.
+Two `tests/test_session.py` tests failed on single CI jobs in one night and passed on rerun, on commits that did not touch `session.py`: `test_main_full_lifecycle` (`main(["start", …])` returned 1 on Python 3.12, run 33277764141) and `test_stop_session_is_prompt` (`stop_session` took 5.02 s against a `< 3.0 s` assertion on Python 3.14, run 33298581269 — 5 s is exactly the `_kernel_alive` probe timeout, so the shutdown ack was missed under load). Every flake costs a 20–30 min rerun. Fix the tests' dependence on wall-clock under xdist load (a start budget that scales, a stop assertion on *behaviour* — ack received — not on seconds), and make a failed `start` print *why*.
 
 ### 69. Return-leg reconciliation: which changesets survived?  [design]
 
