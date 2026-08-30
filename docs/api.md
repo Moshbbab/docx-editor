@@ -378,7 +378,7 @@ A replace landing wholly inside **your own** pending insertion **amends** that i
 
 **Parameters:**
 
-- `find` (str | [`SearchResult`](#searchresult)): Text to find and replace, or a match from `find_text()`/`find_all()` — which also supplies `paragraph` and `occurrence` (pass neither with it). Must not contain `\t`: a tab mark can be matched but not replaced yet — target the text beside it (`ValueError`, ISSUES.md #6)
+- `find` (str | [`SearchResult`](#searchresult)): Text to find and replace, or a match from `find_text()`/`find_all()` — which also supplies `paragraph` and `occurrence` (pass neither with it). Must not contain `\t`: a tab mark can be matched but not replaced yet — target the text beside it (`ValueError`, ROADMAP.md #6)
 - `replace_with` (str): Replacement text
 - `paragraph` (str): Paragraph reference from `list_paragraphs()`, such as `P2#f3c1`. Required unless `find` is a `SearchResult`.
 - `occurrence` (int | None): Which occurrence within the paragraph, 0-based (0 = first). Omitted → the target must be unique within the paragraph; if it matches more than once, [`AmbiguousTextError`](#ambiguoustexterror) is raised instead of silently editing the first match.
@@ -403,7 +403,7 @@ Mark text as deleted with tracked changes. Deleting text inside another author's
 
 **Parameters:**
 
-- `text` (str | [`SearchResult`](#searchresult)): Text to mark as deleted, or a match from `find_text()`/`find_all()` — which also supplies `paragraph` and `occurrence` (pass neither with it). Must not contain `\t`: a tab mark can be matched but not deleted yet — target the text beside it (`ValueError`, ISSUES.md #6)
+- `text` (str | [`SearchResult`](#searchresult)): Text to mark as deleted, or a match from `find_text()`/`find_all()` — which also supplies `paragraph` and `occurrence` (pass neither with it). Must not contain `\t`: a tab mark can be matched but not deleted yet — target the text beside it (`ValueError`, ROADMAP.md #6)
 - `paragraph` (str): Paragraph reference from `list_paragraphs()`, such as `P2#f3c1`. Required unless `text` is a `SearchResult`.
 - `occurrence` (int | None): Which occurrence within the paragraph, 0-based (0 = first). Omitted → the target must be unique within the paragraph; if it matches more than once, [`AmbiguousTextError`](#ambiguoustexterror) is raised instead of silently editing the first match.
 - `note` (str | None): Rationale for this edit, anchored as a comment on the revisions it creates — see [Rationale notes](#rationale-notes)
@@ -486,7 +486,7 @@ if match := doc.find_text("Section 6"):
 > may fall on either side of one. Content text (`replace_with`, insert `text`,
 > `note`, comment bodies) still rejects `\t` — nothing writes a tracked tab —
 > and a `replace`/`delete` target that contains `\t` is rejected with a
-> `ValueError`: a tab can be matched but not removed yet (ISSUES.md #6).
+> `ValueError`: a tab can be matched but not removed yet (ROADMAP.md #6).
 > Because tabs take part in paragraph hashes, refs of tab-bearing paragraphs
 > differ from those computed before tabs were mapped (refs are session-scoped
 > anyway).
@@ -636,7 +636,7 @@ resolve them as a unit with [`accept_group()`](#accept_groupgroup_id) /
 **Parameters:**
 
 - `ref` (str): Paragraph reference from `list_paragraphs()`
-- `new_text` (str): Desired paragraph text. Must hold the same number of `\t` as the paragraph has tab marks: the text between consecutive tabs is rewritten segment by segment, so `rewrite_paragraph(ref, info.text.replace(...))` works on tab-bearing paragraphs and words may move across a tab, while a rewrite that adds or removes a tab raises `ValueError` (ISSUES.md #6)
+- `new_text` (str): Desired paragraph text. Must hold the same number of `\t` as the paragraph has tab marks: the text between consecutive tabs is rewritten segment by segment, so `rewrite_paragraph(ref, info.text.replace(...))` works on tab-bearing paragraphs and words may move across a tab, while a rewrite that adds or removes a tab raises `ValueError` (ROADMAP.md #6)
 - `note` (str | None): Rationale for the rewrite, anchored as one comment spanning its first through last revision — see [Rationale notes](#rationale-notes)
 
 **Returns:** Updated paragraph reference ([`EditResult`](#editresult) — a `str` subclass also carrying the edit's `group_id`/`changeset_id`/`revision_ids`; `group_id` is `None` when `new_text` equals the current text, or when every change landed inside your own pending insertions and amended them in place — undo those by rejecting the group of the amended insertion; `comment_id` carries a `note=`'s comment)
@@ -1077,7 +1077,7 @@ in that set. A moved or deleted paragraph mark resolves approximately: the
 marker is dropped without merging or splitting paragraphs.
 
 Only `word/document.xml` is inspected; headers, footers and footnotes are the
-container-parts epic (ISSUES.md #30).
+container-parts epic (ROADMAP.md #30).
 
 **Parameters:**
 
@@ -1150,7 +1150,7 @@ not because there was nothing to do.
 Rows are [`UnhandledRevision`](#unhandledrevision), deliberately not `Revision`
 objects — they carry nothing `accept_revision()` could act on.
 
-Only `word/document.xml` is inspected (ISSUES.md #30).
+Only `word/document.xml` is inspected (ROADMAP.md #30).
 
 **Parameters:**
 

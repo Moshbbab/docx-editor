@@ -36,11 +36,11 @@ iterating.
 
 ## Pull Requests
 
-**Title:** `type: what changed in the code (ISSUES.md #N)` — imperative, under ~72
+**Title:** `type: what changed in the code (ROADMAP.md #N)` — imperative, under ~72
 chars. Describe the change, not where it came from. No round numbers, batch
 names, phase names, or "as requested".
 
-- ✅ `docs: document the changeset tier and error fields (ISSUES.md #55)`
+- ✅ `docs: document the changeset tier and error fields (ROADMAP.md #55)`
 - ❌ `docs: SKILL.md round-2 sync + [create] extra` — "round-2" is our process, not the reader's problem
 
 **Body:** four short sections, ~200 words total. Longer only if the change is
