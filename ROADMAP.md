@@ -85,6 +85,10 @@ Two `tests/test_session.py` tests failed on single CI jobs in one night and pass
 
 README lists `batch_edit` among the methods taking `note=` (it does not); `docs/api.md` omits `w:numberingChange` from the unhandled-type list; `ResolveResult.unhandled` is described as document-wide but is author-scoped by design (the prose is wrong, not the code); `openspec/changes/` holds three implemented-but-unarchived proposals (`add-batch-edit`, `add-paragraph-hash-anchors`, `add-rewrite-paragraph`) whose text is stale; `Makefile` `test` has no `ulimit -v` fallback for hosts without a systemd user session.
 
+### 81. Workspace creation bypasses the unpack symlink guard
+
+#77 made `unpack_document` refuse a symlinked nearest-existing ancestor of `output_dir`, but `Document.open(path, workspace_dir=<symlink>)` still extracts through the link: `workspace.py` creates the workspace directory before calling unpack, so the guard sees an existing real directory. Applying the same rule at workspace creation would refuse `workspace_dir="/tmp/<new>"` on macOS (`/tmp → private/tmp`), so it needs the same nearest-existing-ancestor rule *and* a decision on whether a user-chosen `workspace_dir` under a system symlink is legitimate (it is on macOS; document or resolve it). Found by the multi-review of PR #88. Also: `openspec/specs/structured-errors/spec.md:49` still describes an unscoped `replace()` call that the runtime rejects.
+
 ### 69. Return-leg reconciliation: which changesets survived?  [design]
 
 The product loop is agent proposes → human adjudicates in Word → document comes back; accepted revisions become plain text, rejected ones vanish, and there is no way to ask "which of my changesets survived?". A sent-vs-returned compare keyed on changeset `w:date` + content. Design first; large.
