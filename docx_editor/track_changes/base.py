@@ -38,7 +38,7 @@ class _RevisionManagerBase:
     _defer_range_sweep: bool
     _range_sweep_pending: bool
 
-    def _revision_element_index(self) -> dict[str, list[Element]]:
+    def _revision_element_index(self, author: str | None = None) -> dict[str, list[Element]]:
         raise NotImplementedError
 
     def _is_in_document(self, elem) -> bool:
@@ -147,7 +147,7 @@ class _RevisionManagerBase:
         raise NotImplementedError
 
     def _find_revision_element(
-        self, revision_id: int, element_index: dict[str, list[Element]] | None
+        self, revision_id: int | None, element_index: dict[str, list[Element]] | None
     ) -> Element | None:
         raise NotImplementedError
 

@@ -22,6 +22,7 @@ from .dom import (
     _nearest_revision_ancestor_id,
     _occurrence_in_text_map,
     _parse_w_date,
+    _revision_author,
 )
 from .models import (
     _MARKUP_KIND_BY_TAG,
@@ -70,9 +71,13 @@ class _ListingMixin(_RevisionManagerBase):
         Counts *pending* revisions only — accepting or rejecting one removes
         it from the DOM, so a document we edited and then fully accepted
         answers False, which is the honest answer: it carries no redline.
-        Ownership is the same test the rest of this class uses, ``w:author``
-        equal to the editor's author, so a foreign redline by someone whose
-        author string happens to match ours reads as ours.
+        Ownership is ``w:author`` equal to the editor's author, so a foreign
+        redline by someone whose author string happens to match ours reads as
+        ours. Deliberately the raw attribute, not ``_revision_author``: the
+        listing's ``"Unknown"`` fallback exists so an unattributed mark can be
+        *named* in a filter, and folding it in here would hand every
+        unattributed mark in the file to an editor who happens to be called
+        "Unknown".
 
         Returns:
             True on the first ``w:ins``/``w:del`` we authored, False if there
@@ -157,6 +162,11 @@ class _ListingMixin(_RevisionManagerBase):
 
         Each paragraph is one line; tracked changes wrap their content as
         ``[ins#{id}:{author}]...[/ins]`` / ``[del#{id}:{author}]...[/del]``,
+        where ``{id}`` is the id ``accept_revision``/``reject_revision`` take
+        (so a raw ``w:id="007"`` renders ``#7``) and ``#?`` marks one they
+        cannot reach at all (outside a change record those are
+        ``list_unhandled_revisions()`` rows; a mark recorded *inside* one
+        renders here but is not listed there — ROADMAP.md #86) —
         nesting included (e.g. ``[ins#1:A]kept [del#9:B]gone[/del][/ins]``).
         The two halves of a content move render the same way as
         ``[moveFrom#{id}:{author}]...[/moveFrom]`` /
@@ -182,8 +192,12 @@ class _ListingMixin(_RevisionManagerBase):
                     continue
                 if child.tagName in _MARKUP_KIND_BY_TAG:
                     kind = _MARKUP_KIND_BY_TAG[child.tagName]
-                    rev_id = child.getAttribute("w:id") or "?"
-                    rev_author = child.getAttribute("w:author") or "Unknown"
+                    # The adjudicable id, not the raw attribute: this view
+                    # names the id ``accept_revision`` takes, and "?" marks
+                    # one it cannot take at all.
+                    parsed_id = _adjudicable_id(child)
+                    rev_id = "?" if parsed_id is None else str(parsed_id)
+                    rev_author = _revision_author(child)
                     parts.append(f"[{kind}#{rev_id}:{rev_author}]{render(child)}[/{kind}]")
                 elif child.tagName in ("w:t", "w:delText"):
                     parts.append(get_text_node_data(child))
@@ -219,7 +233,7 @@ class _ListingMixin(_RevisionManagerBase):
             # ``list_unhandled_revisions`` instead (see ``_unhandled_elements``).
             return None
 
-        author = elem.getAttribute("w:author") or "Unknown"
+        author = _revision_author(elem)
         date = _parse_w_date(elem)
 
         # Extract text content
@@ -272,7 +286,7 @@ class _ListingMixin(_RevisionManagerBase):
             changeset_source=self._changeset_sources.get(changeset_id) if changeset_id is not None else None,
         )
 
-    def _revision_element_index(self) -> dict[str, list[Element]]:
+    def _revision_element_index(self, author: str | None = None) -> dict[str, list[Element]]:
         """Map ``w:id`` -> its handled revision elements, in one recursive walk.
 
         ``HANDLED_REVISION_TAGS`` only: these are the revision elements
@@ -292,18 +306,42 @@ class _ListingMixin(_RevisionManagerBase):
         changeset members never collide (``_reconstruct_groups`` bars every
         duplicated id from every inferred group, and our own allocator keeps
         recorded ids unique), so for those callers every list holds exactly one
-        element. Whole-document resolution (``_resolve_all``) is where the
-        duplicates live: keeping them all lets one index serve every same-id
-        element, so they resolve within a single pass instead of costing a
-        rebuilt index and a whole extra pass each.
+        element. Unfiltered whole-document resolution (``_resolve_all`` with no
+        author) is where the duplicates live: keeping them all lets one index
+        serve every same-id element, so they resolve within a single pass
+        instead of costing a rebuilt index and a whole extra pass each.
+
+        ``author`` scopes the index to that author's elements, which is what
+        makes an author-filtered ``_resolve_all`` unable to reach another
+        author's same-id revision: the lookup has no other candidate to
+        return. Ownership is ``_revision_author`` — the same test
+        ``list_revisions`` and ``_unhandled_elements`` apply, so the index and
+        the listing cannot disagree about who owns an element.
+
+        Keys are ``_adjudicable_id`` in string form, not the raw attribute,
+        for the matching reason on the other half of a revision's identity:
+        the listing reports ``int(w:id)`` and every lookup asks for
+        ``str(int)``, so a raw key would strand a nonconforming ``w:id="007"``
+        — listed as id 7, unreachable through the index, and silently counted
+        as resolved-nothing by a call that reported the document clean. An
+        element with no numeric id is dropped rather than keyed: nothing
+        id-based can reach it, and ``_unhandled_elements`` is what reports it.
 
         Each id's list is in document order — the same order the fresh scan
-        in ``_find_revision_element`` uses, so a duplicated id resolves the
-        same element whichever path finds it.
+        in ``_find_revision_element`` uses, so an *unscoped* index resolves a
+        duplicated id to the same element the scan would. A scoped one
+        deliberately answers differently, which is the whole point of
+        ``author``: the scan would hand back the first element carrying the
+        id, the scoped index the first one this author wrote.
         """
         element_index: dict[str, list[Element]] = {}
         for elem in iter_revision_elements(self.editor.dom, HANDLED_REVISION_TAGS):
-            element_index.setdefault(elem.getAttribute("w:id"), []).append(elem)
+            rev_id = _adjudicable_id(elem)
+            if rev_id is None:
+                continue
+            if author is not None and _revision_author(elem) != author:
+                continue
+            element_index.setdefault(str(rev_id), []).append(elem)
         return element_index
 
     def _is_in_document(self, elem) -> bool:
@@ -325,7 +363,7 @@ class _ListingMixin(_RevisionManagerBase):
         return False
 
     def _find_revision_element(
-        self, revision_id: int, element_index: dict[str, list[Element]] | None
+        self, revision_id: int | None, element_index: dict[str, list[Element]] | None
     ) -> Element | None:
         """Locate the live handled revision element for ``revision_id``.
 
@@ -337,15 +375,34 @@ class _ListingMixin(_RevisionManagerBase):
         Returning the *first still-attached* candidate (rather than a single
         remembered element) is what lets duplicate ids resolve from one index:
         once an element is detached its successor becomes the answer, so N
-        same-id revisions resolve in one pass rather than N.
+        same-id revisions resolve in one pass rather than N. Which elements are
+        candidates at all is the index's business: an author-scoped index
+        (``_revision_element_index(author)``) holds only that author's, so a
+        filtered call cannot land on another author's same-id revision.
+
+        ``revision_id`` is typed wider than the public verbs' ``int`` because
+        this is where an id is *checked*, not promised: ``UnhandledRevision.id``
+        is ``int | None``, so None reaches here in practice and has to resolve
+        nothing rather than match the first unreachable mark.
+
+        Both paths compare ``str`` of the *adjudicable* id, which is what keeps
+        them answering alike. Comparing the parsed int on one side and the
+        index's string key on the other would diverge on everything int-equal
+        but not an int: ``True`` matches id 1 through ``==`` (bool subclasses
+        int) but misses ``.get("True")``, and ``None`` — what
+        ``list_unhandled_revisions()`` reports for a mark with no numeric id —
+        matches every unreachable mark through ``==`` while missing the index
+        entirely. Stringifying both sides leaves one answer per id, whichever
+        path a caller reaches it by.
         """
+        wanted = str(revision_id)
         if element_index is None:
-            wanted = str(revision_id)
             for elem in iter_revision_elements(self.editor.dom, HANDLED_REVISION_TAGS):
-                if elem.getAttribute("w:id") == wanted:
+                rev_id = _adjudicable_id(elem)
+                if rev_id is not None and str(rev_id) == wanted:
                     return elem
             return None
-        for elem in element_index.get(str(revision_id), ()):
+        for elem in element_index.get(wanted, ()):
             if self._is_in_document(elem):
                 return elem
         return None
@@ -379,7 +436,7 @@ class _ListingMixin(_RevisionManagerBase):
         ]
         if author is None:
             return elems
-        return [e for e in elems if (e.getAttribute("w:author") or "Unknown") == author]
+        return [e for e in elems if _revision_author(e) == author]
 
     def list_unhandled_revisions(self, author: str | None = None) -> list[UnhandledRevision]:
         """List the revision elements this library does not accept or reject.
@@ -421,7 +478,7 @@ class _ListingMixin(_RevisionManagerBase):
                 UnhandledRevision(
                     tag=elem.tagName,
                     id=_adjudicable_id(elem),
-                    author=elem.getAttribute("w:author") or "Unknown",
+                    author=_revision_author(elem),
                     date=_parse_w_date(elem),
                     paragraph_ref=ctx.paragraph_ref(paragraph) if paragraph is not None else None,
                 )
